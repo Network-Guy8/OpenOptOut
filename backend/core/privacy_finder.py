@@ -35,7 +35,7 @@ from urllib.parse import urljoin, urlparse
 
 log = logging.getLogger(__name__)
 
-MAX_FETCHES = 8
+MAX_FETCHES = 12
 MAX_BYTES = 1_500_000
 RECHECK_DAYS = 30
 
@@ -66,9 +66,14 @@ LINK_WORDS = [
 ]
 NOT_THIS = re.compile(r"cookie[\s-]*(policy|settings|preferences)|terms|careers|login|sign[\s-]*in|"
                       r"blog|press|facebook|twitter|instagram|linkedin|youtube|apple\.com|google\.com", re.I)
-WELL_KNOWN = ("/opt-out", "/optout", "/do-not-sell", "/privacy-request", "/ccpa", "/removal",
-              "/privacy", "/privacy-policy")
-
+WELL_KNOWN = (
+    "/opt-out", "/optout", "/do-not-sell", "/privacy-request",
+    "/ccpa", "/removal", "/privacy", "/privacy-policy",
+    "/about/privacy-rights",
+    "/about/privacy-rights-other-us-states.php",
+    "/about/privacy-notice",
+    "/corporate/privacy-notice",
+)
 FORM_TALK = re.compile(r"delet|remov|opt[\s-]*out|do not sell|do not share|privacy request|"
                        r"data request|suppress|erase", re.I)
 EMAIL_RE = re.compile(r"\b([a-z0-9._%+-]+)@([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b", re.I)
@@ -98,9 +103,23 @@ def hosted_kind(url: str) -> str:
     return ""
 
 
+PARENT_PRIVACY_DOMAINS = {
+    "realtor.com": {"move.com"},
+    "trulia.com": {"zillow.com", "zillowgroup.com"},
+    "zillow.com": {"zillowgroup.com"},
+    "homes.com": {"costar.com"},
+}
+
+
+def _trusted_privacy_host(host: str, domain: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    trusted = {domain.lower().rstrip(".")}
+    trusted.update(PARENT_PRIVACY_DOMAINS.get(domain.lower().rstrip("."), set()))
+    return any(host == d or host.endswith("." + d) for d in trusted)
+
+
 def _same_site(url: str, domain: str) -> bool:
-    h = _host(url)
-    return h == domain or h.endswith("." + domain)
+    return _trusted_privacy_host(_host(url), domain)
 
 
 def normalize_finding_url(url: str) -> str:
@@ -161,19 +180,45 @@ def score_link(url: str, label: str) -> int:
     return max([w for rx, w in LINK_WORDS if rx.search(hay)] or [0])
 
 
+
 def privacy_emails(page_html: str, domain: str) -> list:
-    """Privacy-looking addresses on the broker's own domain."""
+    """Find privacy emails, including Cloudflare-obfuscated addresses."""
     found = []
-    for local, dom in EMAIL_RE.findall(_html.unescape(page_html or "")):
+    html = _html.unescape(page_html or "")
+
+    candidates = list(EMAIL_RE.findall(html))
+
+    # Decode Cloudflare-protected email addresses.
+    for encoded in re.findall(
+        r'data-cfemail=["\']([0-9a-fA-F]+)["\']', html, re.I
+    ):
+        try:
+            raw = bytes.fromhex(encoded)
+            if len(raw) < 2:
+                continue
+
+            key = raw[0]
+            decoded = bytes(b ^ key for b in raw[1:]).decode("utf-8")
+
+            match = EMAIL_RE.fullmatch(decoded)
+            if match:
+                candidates.append(match.groups())
+        except (ValueError, UnicodeDecodeError):
+            continue
+
+    for local, dom in candidates:
         local = re.sub(
             r"^(?:u003e)+(?=(?:privacy|dpo|optout|opt-out|dsar|"
             r"ccpa|gdpr|removal|remove|delete|legal))",
             "", local, flags=re.I
         )
         addr = f"{local}@{dom}".lower()
-        if (dom.lower() == domain or dom.lower().endswith("." + domain)) and PRIVACY_LOCAL.search(local) \
-                and addr not in found:
+
+        if (_trusted_privacy_host(dom, domain)
+                and PRIVACY_LOCAL.search(local)
+                and addr not in found):
             found.append(addr)
+
     return found
 
 
@@ -325,8 +370,10 @@ def find(domain: str, fetch=None) -> dict:
         for url, label in links_in(home[1], home[0]):
             if url.lower().startswith("mailto:"):
                 addr = url[7:].split("?")[0].lower()
-                if addr.split("@")[-1].endswith(domain) and PRIVACY_LOCAL.search(addr.split("@")[0]):
-                    add("mailto:" + addr, "email", addr, 4)
+                if "@" in addr:
+                    local, mail_domain = addr.rsplit("@", 1)
+                    if _trusted_privacy_host(mail_domain, domain) and PRIVACY_LOCAL.search(local):
+                        add("mailto:" + addr, "email", addr, 4)
                 continue
             s = score_link(url, label)
             if s and (_allowed(url, domain)):
@@ -335,7 +382,7 @@ def find(domain: str, fetch=None) -> dict:
                     add(url, hk, label, s)
                 candidates.append((s, url, label))
     candidates.sort(key=lambda c: -c[0])
-    for s, url, label in candidates[:4]:
+    for s, url, label in candidates[:8]:
         res = visit(url)
         if not res:
             continue
@@ -343,7 +390,7 @@ def find(domain: str, fetch=None) -> dict:
             hk = hosted_kind(sub)
             if hk:
                 add(sub, hk, sub_label or label, 20)
-            elif _allowed(sub, domain) and score_link(sub, sub_label) >= 8 and len(seen_pages) < MAX_FETCHES:
+            elif _allowed(sub, domain) and score_link(sub, sub_label) >= 3 and len(seen_pages) < MAX_FETCHES:
                 visit(sub)
     if not any(f["kind"] != "email" for f in findings.values()):
         for path in WELL_KNOWN:
@@ -406,6 +453,16 @@ def run_for_broker(db, broker, fetch=None, now=None) -> dict:
     from .listing_finder import broker_domain, registrable_domain
     now = now or datetime.utcnow()
     host = verified_broker_domain(broker)
+    if not host and not (getattr(broker, "website", None) or "").strip():
+        # Discovery-only fallback for brokers named by their domain.
+        # Do not change the broker's approved website.
+        name = (getattr(broker, "name", "") or "").strip().lower()
+        if re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+            name,
+        ) and not name.endswith((".local", ".internal", ".localhost", ".test")):
+            host = name
     if not host:
         return {"findings": [], "fetched": 0, "blocked": False, "error": "no website for this broker"}
     domain = registrable_domain(host)
