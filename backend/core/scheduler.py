@@ -919,9 +919,11 @@ def _is_callapp_alias_message(to_header: str, from_header: str) -> bool:
         for _, address in getaddresses([to_header or ""])
     }
     sender = parseaddr(from_header or "")[1].strip().lower()
+    alias = os.getenv("CALLAPP_OPTOUT_ALIAS", "").strip().lower()
 
     return (
-        "callapp-optout@example.com" in recipients
+        bool(alias)
+        and alias in recipients
         and sender.endswith("@callapp.com")
     )
 
