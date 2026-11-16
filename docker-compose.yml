@@ -43,7 +43,9 @@ services:
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
       - SETTINGS_FILE=/data/openoptout_settings.json
       # Web search goes through the bundled SearXNG (service below). Empty = off.
-      - SEARXNG_URL=${SEARXNG_URL-http://searxng:8080}
+      - SEARXNG_URL=${SEARXNG_URL:-http://searxng:8080}
+      # CallApp manual opt-out mailbox
+      - CALLAPP_OPTOUT_ALIAS=${CALLAPP_OPTOUT_ALIAS:-}
 
       # ── Database ────────────────────────────────────────────────────────────
       # SQLite by default (fine for families / small staff deployments).

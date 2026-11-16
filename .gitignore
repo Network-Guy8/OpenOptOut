@@ -110,3 +110,6 @@ deploy/searxng/*.pre-*
 
 # Local experimental Docker overrides
 compose.plugin-sandbox.yaml
+
+# Local production Docker overrides
+compose.production.yaml
