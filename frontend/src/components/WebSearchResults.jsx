@@ -54,13 +54,23 @@ export default function WebSearchResults({ memberId, memberName, onAdded }) {
   const act = async (h, kind) => {
     try {
       if (kind === 'add') { const { data } = await api.post(`/web-search/hits/${h.id}/add`); setMsg(data.message); onAdded && onAdded() }
-      else { await api.post(`/web-search/hits/${h.id}/dismiss`, { reason: 'not_me' }); setMsg(tx("Got it — that page won't be shown again.")) }
+      else if (kind === 'keep') {
+        await api.post(`/web-search/hits/${h.id}/dismiss`, { reason: 'keep_listing' })
+        setMsg(tx("Listing confirmed and kept public. No new removal will be started for this page."))
+      } else if (kind === 'restore') {
+        await api.post(`/web-search/hits/${h.id}/restore`)
+        setMsg(tx("Keep Listing decision undone."))
+      } else {
+        await api.post(`/web-search/hits/${h.id}/dismiss`, { reason: 'not_me' })
+        setMsg(tx("Got it — that page won't be shown again."))
+      }
       load()
     } catch (e) { setMsg(detailText(e) || tx("Couldn't save that.")) }
   }
 
   const review = hits.filter(h => h.status === 'new')
   const added = hits.filter(h => h.status === 'added')
+  const kept = hits.filter(h => h.status === 'dismissed' && h.dismiss_reason === 'keep_listing')
 
   return (
     <div className="mt-5 pt-4 border-t border-slate-700/50">
@@ -103,6 +113,12 @@ export default function WebSearchResults({ memberId, memberName, onAdded }) {
                     aria-label={tx("That's {v}: add {domain} to removals", { v: memberName || 'me', domain: h.domain })}>
                     <Check size={13} aria-hidden="true" />{" "}{tx("That's {v}", { v: memberName ? memberName.split(' ')[0] : 'me' })}
                   </button>
+                  <button onClick={() => act(h, 'keep')}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-sky-600 text-sky-300 text-xs"
+                    aria-label={tx("Keep this listing public for {v}", { v: memberName || 'me' })}>
+                    <Check size={13} aria-hidden="true" />{" "}
+                    {tx("That's {v} — Ignore", { v: memberName ? memberName.split(' ')[0] : 'me' })}
+                  </button>
                   <button onClick={() => act(h, 'dismiss')} className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-600 text-slate-300 text-xs"
                     aria-label={tx("Not {v}: hide this result", { v: memberName || 'me' })}>
                     <X size={13} aria-hidden="true" />{" "}{tx("Not {v}", { v: memberName ? memberName.split(' ')[0] : 'me' })}
@@ -115,6 +131,25 @@ export default function WebSearchResults({ memberId, memberName, onAdded }) {
       )}
       {review.length === 0 && !run.running && hits.length > 0 && (
         <p className="text-sm text-slate-400 mt-3">{tx("Nothing waiting for review.")}</p>
+      )}
+
+      {kept.length > 0 && (
+        <div className="mt-4 rounded-lg border border-sky-900/60 p-3">
+          <p className="text-sm text-sky-300 mb-2">
+            {tx("Kept public ({length})", { length: kept.length })}
+          </p>
+          <ul className="space-y-2">
+            {kept.map(h => (
+              <li key={h.id} className="flex items-center justify-between gap-3 text-xs">
+                <span className="text-slate-300 break-all">{h.title || h.url}</span>
+                <button type="button" onClick={() => act(h, 'restore')}
+                  className="shrink-0 text-sky-300 hover:underline">
+                  {tx("Undo")}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
 
       {added.length > 0 && (

@@ -63,10 +63,21 @@ def solve(ch):
     meta = ch.meta or {}
     service, key, base = meta.get("service"), meta.get("api_key"), meta.get("service_base")
     if not (service and key and base):
-        return {"defer_to_human": True}
+        return {
+            "solved": False,
+            "error": "Missing CAPTCHA service configuration",
+        }
+
     task = build_task(ch, service)
     if task is None:
-        return {"defer_to_human": True}
+        return {
+            "solved": False,
+            "error": (
+                f"Cannot build CAPTCHA task: type={ch.type}, "
+                f"site_key_present={bool(ch.site_key)}, "
+                f"page_url_present={bool(ch.page_url)}"
+            ),
+        }
     try:
         created = _post(base, "/createTask", {"clientKey": key, "task": task})
         if created.get("errorId"):
@@ -85,7 +96,10 @@ def solve(ch):
                     return {"solved": False, "error": "no answer in the reply"}
                 # For a picture CAPTCHA the "token" is the text to type in.
                 return {"solved": True, "token": value}
-        return {"defer_to_human": True}
+        return {
+            "solved": False,
+            "error": "CAPTCHA service timed out after 120 seconds",
+        }
     except Exception as e:
         return {"solved": False, "error": str(e)[:200]}
 

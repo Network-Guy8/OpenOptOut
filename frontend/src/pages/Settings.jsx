@@ -732,6 +732,97 @@ function SchedulerSection({ initial, memberConfigs, onMemberConfigUpdate, userRo
             </Field>
           </div>
 
+          {/* Rotating SearXNG searches */}
+          <div className="border-t border-slate-700/50 pt-4">
+            <p className="text-slate-300 text-sm font-medium mb-3">
+              {tx("Rotating SearXNG broker searches")}
+            </p>
+
+            <label className="flex items-center gap-2 mb-3 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                checked={form.broker_search_enabled ?? false}
+                onChange={e => setForm(f => ({
+                  ...f,
+                  broker_search_enabled: e.target.checked
+                }))}
+              />
+              {tx("Enable rotating broker searches")}
+            </label>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Field label={tx("Search interval")}>
+                <select
+                  className={inp}
+                  value={form.broker_search_interval_hours ?? 12}
+                  onChange={e => setForm(f => ({
+                    ...f,
+                    broker_search_interval_hours: Number(e.target.value)
+                  }))}
+                >
+                  {[6, 12, 24, 48, 168].map(h => (
+                    <option key={h} value={h}>
+                      {h === 168 ? tx("Every 7 days") : `${h} ${tx("hours")}`}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+
+              {[
+                ["broker_search_daily_limit", "Maximum queries per day", 100],
+                ["broker_search_run_limit", "Maximum queries per run", 50],
+                ["broker_search_recheck_days", "Recheck broker/member after (days)", 30],
+              ].map(([key, label, defaultValue]) => (
+                <Field key={key} label={tx(label)}>
+                  <input
+                    type="number"
+                    min="1"
+                    className={inp}
+                    value={form[key] ?? defaultValue}
+                    onChange={e => setForm(f => ({
+                      ...f,
+                      [key]: Number(e.target.value)
+                    }))}
+                  />
+                </Field>
+              ))}
+            </div>
+
+            <p className="text-slate-500 text-xs mt-2">
+              {tx("Uses your existing SearXNG connection. Searches may disclose member details to upstream search engines.")}
+            </p>
+          </div>
+
+          {/* Independent background checks */}
+          <div className="border-t border-slate-700/50 pt-4">
+            <p className="text-slate-300 text-sm font-medium mb-3">
+              {tx("Background checks")}
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {[
+                ["broker_health_interval_hours", "Broker website checks"],
+                ["verification_interval_hours", "Removal verification"],
+              ].map(([key, label]) => (
+                <Field key={key} label={tx(label)}>
+                  <select className={inp}
+                    value={form[key] ?? 24}
+                    onChange={e => setForm(f => ({
+                      ...f, [key]: Number(e.target.value)
+                    }))}>
+                    {[6, 12, 24, 48, 168].map(h => (
+                      <option key={h} value={h}>
+                        {h === 168 ? tx("Every 7 days") : `${h} ${tx("hours")}`}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ))}
+            </div>
+            <p className="text-slate-500 text-xs mt-2">
+              {tx("Website checks test broker availability. Removal verification checks existing requests.")}
+            </p>
+          </div>
+
           {/* ── Which brokers go first ── */}
           <div className="border-t border-slate-700/50 pt-4">
             <label htmlFor="dispatch-order" className="text-slate-400 text-xs font-medium mb-2 block">{tx("Which brokers go first each day")}</label>

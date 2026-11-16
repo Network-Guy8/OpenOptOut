@@ -649,8 +649,15 @@ class PluginManager:
             for pid, rp in list(self.running.items()):
                 # Process died?
                 if rp.process.poll() is not None:
-                    log.warning("Plugin %s exited unexpectedly (code %s)", pid, rp.process.returncode)
-                    self._handle_crash(pid, "process exited")
+                    exit_code = rp.process.returncode
+                    try:
+                        stderr = rp.process.stderr.read()[-4000:]
+                    except Exception as e:
+                        stderr = f"Could not read stderr: {e}"
+
+                    reason = f"process exited (code {exit_code}): {stderr}"
+                    log.error("Plugin %s: %s", pid, reason)
+                    self._handle_crash(pid, reason)
                     continue
                 # Liveness ping
                 try:
@@ -968,7 +975,18 @@ class PluginManager:
                 resp = rp.stub.SolveCaptcha(req, timeout=rp.manifest.timeout_seconds)
                 # A plugin that defers or solves is a real answer; a plugin that
                 # errors/does-nothing falls through to the next solver.
-                if resp.solved or resp.defer_to_human:
+                log.info(
+                    "CAPTCHA solver %s: type=%s site_key_present=%s "
+                    "page_url_present=%s solved=%s deferred=%s error=%s",
+                    pid,
+                    challenge.get("type"),
+                    bool(challenge.get("site_key")),
+                    bool(challenge.get("page_url")),
+                    resp.solved,
+                    resp.defer_to_human,
+                    bool(resp.error),
+                )
+                if resp.solved or resp.defer_to_human or resp.error:
                     return {
                         "solved": resp.solved, "token": resp.token,
                         "defer_to_human": resp.defer_to_human,

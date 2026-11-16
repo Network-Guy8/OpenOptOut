@@ -637,6 +637,7 @@ class Broker(Base):
     id                 = Column(Integer, primary_key=True, index=True)
     name               = Column(String, unique=True, nullable=False, index=True)
     opt_out_url        = Column(String)
+    website            = Column(String(1000), nullable=True)
     method             = Column(SAEnum(OptOutMethod), default=OptOutMethod.form)
     difficulty         = Column(SAEnum(Difficulty), default=Difficulty.medium)
     status             = Column(SAEnum(BrokerStatus), default=BrokerStatus.compliant)
@@ -691,6 +692,20 @@ class Broker(Base):
     requests = relationship("RemovalRequest", back_populates="broker")
     health   = relationship("BrokerHealth", back_populates="broker", uselist=False)
     parent   = relationship("ParentCompany", back_populates="children")
+
+
+
+class BrokerWebsiteCandidate(Base):
+    """Unverified official-website candidate found during broker discovery."""
+    __tablename__ = "broker_website_candidates"
+
+    id = Column(Integer, primary_key=True)
+    broker_id = Column(Integer, ForeignKey("brokers.id", ondelete="CASCADE"),
+                       nullable=False, index=True)
+    url = Column(String(1000), nullable=False)
+    source = Column(String(50), nullable=False, default="searxng")
+    status = Column(String(20), nullable=False, default="pending")
+    found_at = Column(DateTime, default=datetime.utcnow)
 
 
 class BrokerHealth(Base):
@@ -1223,3 +1238,16 @@ class PluginViolation(Base):
     detail     = Column(Text, nullable=True)
     action_taken = Column(String, nullable=True)  # auto_disabled|warned|lockdown_disabled
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class BreachMonitor(Base):
+    """Selected identities and findings are encrypted; disabled by default."""
+    __tablename__ = "breach_monitors"
+    member_id = Column(Integer, ForeignKey("family_members.id"), primary_key=True)
+    enabled = Column(Boolean, default=False, nullable=False)
+    payload = Column(EncryptedText, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+    next_attempt_at = Column(DateTime, nullable=True)
+    lease_token = Column(String(32), nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    error_code = Column(String(40), nullable=True)

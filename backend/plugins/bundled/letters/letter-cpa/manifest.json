@@ -1,0 +1,9 @@
+{
+  "id": "letter-cpa",
+  "type": "letters",
+  "name": "Colorado Privacy Act letter",
+  "version": "1.0.0",
+  "author": "OpenOptOut contributors",
+  "description": "Privacy deletion and opt-out request for Colorado residents under the Colorado Privacy Act. Draft awaiting legal review.",
+  "api_version": "1.0"
+}

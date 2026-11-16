@@ -145,7 +145,7 @@ def _url_hash(url: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
-def run_for_member(db, member, cfg: dict, search=None, pause: float = 1.0) -> dict:
+def run_for_member(db, member, cfg: dict, search=None, pause: float = 1.0, queries_override=None) -> dict:
     """
     Run the member's searches, store new results, and add strong matches on
     known brokers to the removal cycle. `search(query) -> [ {url,title,snippet} ]`
@@ -162,7 +162,7 @@ def run_for_member(db, member, cfg: dict, search=None, pause: float = 1.0) -> di
         search = lambda q: provider(ws, q)   # noqa: E731
 
     profile = lf._profile(member)
-    queries = lf.discovery_queries(member)[: int(ws.get("max_queries") or 12)]
+    queries = queries_override if queries_override is not None else lf.discovery_queries(member)[: int(ws.get("max_queries") or 12)]
     stats = {"queries": 0, "results": 0, "new": 0, "added": 0, "errors": []}
     now = datetime.utcnow()
     unclear_cache, per_broker = {}, {}
@@ -195,6 +195,8 @@ def run_for_member(db, member, cfg: dict, search=None, pause: float = 1.0) -> di
                 hit.last_seen_at = now
                 continue
             strength, matched_on = score(profile, " ".join([r.get("title", ""), r.get("snippet", ""), url]))
+            if not matched_on:
+                continue
             broker = lf.resolve_broker(db, url)["broker"]
             hit = WebSearchHit(member_id=member.id, url=url, url_hash=h, domain=domain,
                                title=(r.get("title") or "")[:500], snippet=(r.get("snippet") or "")[:1000],
@@ -254,6 +256,8 @@ def run_for_member(db, member, cfg: dict, search=None, pause: float = 1.0) -> di
 def add_hit(db, hit, member) -> dict:
     """The person says this page is about them: put it in the removal cycle."""
     from . import listing_finder as lf
+    if hit.status == "dismissed" and hit.dismiss_reason == "keep_listing":
+        raise ValueError("This listing is marked Keep Listing. Undo that decision first.")
     res = lf.add_listing(db, member, hit.url, source="web_search")
     hit.status = "added"
     hit.request_id = res.get("request_id")
@@ -263,7 +267,7 @@ def add_hit(db, hit, member) -> dict:
 
 def dismiss_hit(db, hit, reason: str = "not_me") -> None:
     hit.status = "dismissed"
-    hit.dismiss_reason = reason if reason in ("not_me", "not_broker") else "not_me"
+    hit.dismiss_reason = reason if reason in ("not_me", "not_broker", "keep_listing") else "not_me"
     db.commit()
 
 

@@ -8,7 +8,7 @@ Pass 2: triggered by opt-out engine using full matrix on confirmed brokers
 import asyncio, logging, re, time, uuid
 from datetime import datetime
 from typing import Optional, Any
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse, parse_qs, urljoin
 
 try:
     from playwright.async_api import async_playwright, BrowserContext, Page, TimeoutError as PWTimeout
@@ -102,6 +102,30 @@ def _city_state(address: Optional[str]) -> tuple[str, str]:
 
 # ── Google search ─────────────────────────────────────────────────────────────
 
+
+def _broker_result_url(href: str, broker_domain: str) -> Optional[str]:
+    """Accept only HTTP(S) result URLs hosted by the intended broker."""
+    try:
+        parsed = urlparse(urljoin("https://www.google.com/", href))
+        if parsed.hostname == "www.google.com" and parsed.path == "/url":
+            params = parse_qs(parsed.query)
+            href = (params.get("q") or params.get("url") or [""])[0]
+            parsed = urlparse(href)
+
+        host = (parsed.hostname or "").lower().removesuffix(".")
+        domain = broker_domain.lower().removeprefix("www.").removesuffix(".")
+        if (
+            parsed.scheme in ("http", "https")
+            and domain
+            and (host == domain or host.endswith("." + domain))
+            and not parsed.username
+            and not parsed.password
+        ):
+            return parsed.geturl()
+    except ValueError:
+        pass
+    return None
+
 async def _google_search(page: Page, combo: IdentityCombo, broker_domain: str) -> list[dict]:
     query = f'site:{broker_domain} "{combo.name}"'
     if combo.city:  query += f' "{combo.city}"'
@@ -118,8 +142,9 @@ async def _google_search(page: Page, combo: IdentityCombo, broker_domain: str) -
         links = await page.query_selector_all("a[href]")
         seen  = set()
         for link in links:
-            href = await link.get_attribute("href") or ""
-            if broker_domain in href and "google.com" not in href and href not in seen:
+            raw_href = await link.get_attribute("href") or ""
+            href = _broker_result_url(raw_href, broker_domain)
+            if href and href not in seen:
                 seen.add(href)
                 try:
                     parent  = await link.evaluate_handle(
@@ -226,9 +251,9 @@ async def _discover_combo(
 
     broker_domain = ""
     if broker.opt_out_url:
-        broker_domain = urlparse(broker.opt_out_url).netloc.lstrip("www.")
+        broker_domain = urlparse(broker.opt_out_url).netloc.removeprefix("www.")
     if not broker_domain and "." in broker.name:
-        broker_domain = broker.name.lstrip("www.")
+        broker_domain = broker.name.removeprefix("www.")
 
     try:
         if broker_domain:
@@ -335,8 +360,7 @@ async def run_discovery_for_member(member_id: int) -> dict:
                         existing = db.query(RemovalRequest).filter(
                             RemovalRequest.member_id == member_id,
                             RemovalRequest.broker_id == broker.id,
-                            RemovalRequest.status == RequestStatus.pending,
-                        ).first()
+                        ).order_by(RemovalRequest.created_at.desc()).first()
                         if not existing:
                             db.add(RemovalRequest(
                                 member_id=member_id,

@@ -79,6 +79,7 @@ def _build_exhaustive_email(
     request_key: str,
     script: Optional[BrokerScript],
     db = None,
+    listing_url: str = "",
 ) -> tuple[str, str]:
     """
     Build a single opt-out email listing ALL identity variants.
@@ -174,6 +175,10 @@ def _build_exhaustive_email(
             body = body.rstrip() + "\n\n" + identifiers_block + "\n"
     else:
         body = letter.body
+
+    if listing_url:
+        body += f"\n\nSpecific listing requested for removal:\n{listing_url.strip()}"
+
     return subject, body
 
 
@@ -244,6 +249,7 @@ def send_opt_out_email(
     script: Optional[BrokerScript],
     cfg: dict,
     db,
+    listing_url: str = "",
 ) -> bool:
     """
     Send one exhaustive opt-out email to a single broker, FROM the member's own
@@ -270,7 +276,9 @@ def send_opt_out_email(
         log.info("Not sending %s opt-out for member_id=%s: %s", broker.name, member.id, reason)
         return False
 
-    subject, body = _build_exhaustive_email(member, broker, request_key, script, db=db)
+    subject, body = _build_exhaustive_email(
+        member, broker, request_key, script, db=db, listing_url=listing_url
+    )
     try:
         result = mbx.send_from_mailbox(cfg, mailbox, [to_email], subject, body,
                                        reply_to=contact.address)
@@ -619,6 +627,7 @@ async def _run_form_via_interpreter(
     captcha_solver_override=None,
     preset_listing_url: Optional[str] = None,
     person_hook_override=None,
+    captcha_budget=None,
 ):
     """
     Run a form opt-out through the unified declarative interpreter engine:
@@ -721,8 +730,23 @@ async def _run_form_via_interpreter(
         if mgr:
             preferred_captcha = getattr(broker, "captcha_plugin_id", None)
             from .captcha_services import plugin_meta
-            captcha_solver = lambda ch: mgr.dispatch_solve_captcha(ch, preferred_plugin_id=preferred_captcha,
-                                                                   meta_for=plugin_meta)
+            def captcha_solver(ch):
+                if captcha_budget is not None:
+                    if captcha_budget["remaining"] <= 0:
+                        return {
+                            "solved": False,
+                            "defer_to_human": True,
+                            "error": "CAPTCHA attempt budget exhausted",
+                            "plugin_id": "budget_guard",
+                        }
+
+                    captcha_budget["remaining"] -= 1
+
+                return mgr.dispatch_solve_captcha(
+                    ch,
+                    preferred_plugin_id=preferred_captcha,
+                    meta_for=plugin_meta,
+                )
             def form_handler(job_, page_context):
                 if isinstance(page_context, dict):
                     page_html = page_context.get("html", "")
@@ -763,16 +787,38 @@ async def _run_form_via_interpreter(
             captcha_solver = captcha_solver_override
         from .listing_finder import _profile as match_profile
         from .match_policy import for_member as unclear_policy
+        from .interpreter.hosted_forms import is_found_form
         executor = PlaywrightExecutor(
-            page=page, captcha_solver=captcha_solver, plugin_form_handler=form_handler,
+            page=page, captcha_solver=captcha_solver,
+            plugin_form_handler=None if is_found_form(spec) else form_handler,
             secrets=member_secrets(member), match_profile=match_profile(member),
             unclear_policy=unclear_policy(db, member, cfg), preset_listing_url=preset_listing_url,
             listing_pattern=getattr(spec, "listing_pattern", "") or "",
             person_hook=person_hook_override)
         res = await executor.run(job)
+        import logging
+        logging.getLogger(__name__).warning(
+            "OPTOUT TRACE broker=%s request=%s ok=%s verified=%s "
+            "needs_captcha=%s needs_manual=%s steps=%s",
+            broker.name,
+            request.id,
+            res.ok,
+            res.verified,
+            res.needs_captcha,
+            res.needs_manual,
+            res.trace,
+        )
         if res.email_rejected and "+" in (job.contact_email or ""):
             res = await _retry_without_plus(db, request, broker, member, spec, combo, member_fields,
                                             page, captcha_solver, form_handler, res)
+        if res.ok and not res.verified and job.method == "form":
+            try:
+                body = await page.locator("body").inner_text(timeout=3000)
+            except Exception:
+                body = ""
+
+            if GENERIC_SUCCESS.search(body or ""):
+                res.verified = True
         if res.ok and is_heuristic(spec) and not res.verified:
             # A best guess only counts when the site says it worked.
             try:
@@ -789,6 +835,42 @@ async def _run_form_via_interpreter(
                                       f"OpenOptOut tried {broker.name}'s form but couldn't tell whether it "
                                       f"went through. Open {broker.opt_out_url or broker.name}, check or "
                                       f"finish the opt-out for {member.full_name}, then press \"I've done this\"."))
+        from .interpreter.hosted_forms import is_found_form
+        if (is_found_form(spec) and res.ok
+                and not res.verified
+                and not (
+                    person_hook_override is not None
+                    and getattr(res, "human_confirmed_submission", False)
+                )):
+            from .interpreter.executor import ExecResult
+            return ExecResult(
+                ok=False,
+                needs_manual=True,
+                trace=res.trace,
+                detail="discovered form completion not verified",
+                human_instruction=(
+                    f"OpenOptOut could not verify completion of {broker.name}'s "
+                    "privacy request. Check the broker's website or confirmation "
+                    "email. Do not submit a duplicate request unless necessary."
+                ),
+            )
+        if (res.ok and job.method == "form" and not res.verified
+                and not (
+                    person_hook_override is not None
+                    and getattr(res, "human_confirmed_submission", False)
+                )):
+            from .interpreter.executor import ExecResult
+            return ExecResult(
+                ok=False,
+                needs_manual=True,
+                trace=res.trace,
+                detail="form submission not verified",
+                human_instruction=(
+                    f"OpenOptOut completed {broker.name}'s form but could not "
+                    "verify that the broker accepted the request. Check the "
+                    "broker's website or confirmation email before submitting again."
+                ),
+            )
         res.contact_email = job.contact_email
         return res
     finally:
@@ -910,8 +992,10 @@ async def _retry_without_plus(db, request, broker, member, spec, combo, member_f
     fields = dict(member_fields, contact_email=contact.address)
     job = compile_job(spec, fields, member_id=str(member.id), lang=_member_lang(member))
     from .captcha_privacy import member_secrets
+    from .interpreter.hosted_forms import is_found_form
     res = await PlaywrightExecutor(page=page, captcha_solver=captcha_solver,
-                                   plugin_form_handler=form_handler, secrets=member_secrets(member)).run(job)
+                                   plugin_form_handler=None if is_found_form(spec) else form_handler,
+                                   secrets=member_secrets(member)).run(job)
     if res.email_rejected:
         return ExecResult(ok=False, needs_manual=True, detail="form refused the email address",
                           trace=res.trace,
@@ -943,6 +1027,7 @@ async def execute_optout(
 
     successes = 0
     failures  = 0
+    captcha_budget = {"remaining": 1}
     last_error = ""   # captured for broker-health failure classification
     needs_human = ""  # plain-language instruction when a person must finish this
     handoff = None    # where a person can pick the flow up live (JSON, stored encrypted)
@@ -978,7 +1063,10 @@ async def execute_optout(
 
         elif broker.method == OptOutMethod.email:
             # Single exhaustive email covering all variants
-            ok = send_opt_out_email(member, broker, key, script, cfg, db)
+            ok = send_opt_out_email(
+                member, broker, key, script, cfg, db,
+                listing_url=request.listing_url or ""
+            )
             if ok:
                 successes += 1
                 from .variant_report import record as _record_variants, identities_in_email
@@ -1030,8 +1118,12 @@ async def execute_optout(
                 runs += 1
                 page = await context.new_page()
                 try:
-                    interp_res = await _run_form_via_interpreter(request, page, cfg, db, combo=combo,
-                                                                 preset_listing_url=preset_url)
+                    interp_res = await _run_form_via_interpreter(
+                        request, page, cfg, db,
+                        combo=combo,
+                        preset_listing_url=preset_url,
+                        captcha_budget=captcha_budget,
+                    )
                     ok = interp_res.ok
                     # Listing picked from the site's search results (core/match_policy.py)
                     for u in getattr(interp_res, "extra_picks", None) or []:
@@ -1079,6 +1171,17 @@ async def execute_optout(
                             CaptchaChallenge.request_id == request.id,
                             CaptchaChallenge.status == "pending"
                         ).first()
+                        if existing_ch:
+                            # Refresh stale CAPTCHA metadata on subsequent attempts.
+                            if ch.get("site_key"):
+                                existing_ch.site_key = ch["site_key"]
+                            if ch.get("type"):
+                                existing_ch.challenge_type = ch["type"]
+                            if ch.get("page_url"):
+                                existing_ch.page_url = ch["page_url"]
+                            if screenshot_path:
+                                existing_ch.screenshot = screenshot_path
+                            db.commit()
                         if not existing_ch:
                             c_entry = CaptchaChallenge(
                                 request_id=request.id,
@@ -1112,6 +1215,24 @@ async def execute_optout(
                             request.notes += (f". If you finish it on the site yourself, give "
                                               f"{interp_res.contact_email} as the email address, so "
                                               f"OpenOptOut can match the reply and click any confirmation link.")
+
+                        # Preserve the CAPTCHA solver outcome for troubleshooting.
+                        # Never persist the full trace, which may contain page data.
+                        captcha_lines = [
+                            str(line) for line in (interp_res.trace or [])
+                            if "CAPTCHA solver" in str(line)
+                        ]
+                        if captcha_lines:
+                            solver_note = captcha_lines[-1]
+                            # Avoid persisting credentials or sensitive URLs
+                            # that a plugin exception might contain.
+                            if not any(x in solver_note.lower() for x in
+                                       ("api_key", "clientkey", "authorization",
+                                        "bearer ", "https://", "http://")):
+                                request.notes += (
+                                    "\nCAPTCHA solver diagnostic: "
+                                    + solver_note[:250]
+                                )
 
                     # A spec's pause_for_human step: the flow reached a point
                     # only a person can do (pick their listing, answer a phone
@@ -1229,6 +1350,17 @@ async def execute_optout(
         request.sent_at   = datetime.utcnow()
         recheck_days      = cfg.get("scheduler", {}).get("recheck_interval_days", 90)
         request.recheck_after = datetime.utcnow() + timedelta(days=recheck_days)
+        # A successful submission supersedes any earlier CAPTCHA pause.
+        if request.notes and request.notes.startswith("Stopped at a CAPTCHA"):
+            request.notes = None
+
+        # Close stale human-CAPTCHA challenges for this request.
+        from ..models.database import CaptchaChallenge
+        for challenge in db.query(CaptchaChallenge).filter(
+            CaptchaChallenge.request_id == request.id,
+            CaptchaChallenge.status == "pending",
+        ).all():
+            challenge.status = "dismissed"
         # A form stays "sent" even when the broker's page said "received":
         # that's an accepted request, not a removal. It becomes confirmed when
         # the broker writes back, its confirmation link is clicked, or a person
@@ -1294,7 +1426,9 @@ async def execute_optout(
     return successes > 0
 
 
-async def run_optout_batch(request_ids: list[int]) -> dict:
+async def run_optout_batch(
+    request_ids: list[int], allow_captcha_retry: bool = False
+) -> dict:
     from .network_health import is_internet_available, is_network_error
 
     if not is_internet_available():
@@ -1315,12 +1449,25 @@ async def run_optout_batch(request_ids: list[int]) -> dict:
 
     try:
         async with async_playwright() as p:
-            browser, _ = await _launch_browser(p)
+            browser = None
             try:
                 for req_id in request_ids:
                     req = db.query(RemovalRequest).filter(RemovalRequest.id == req_id).first()
                     if not req or req.status != RequestStatus.pending:
                         skipped += 1; continue
+                    # Never automatically retry an unresolved CAPTCHA.
+                    from ..models.database import CaptchaChallenge
+                    pending_captcha = db.query(CaptchaChallenge.id).filter(
+                        CaptchaChallenge.request_id == req.id,
+                        CaptchaChallenge.status == "pending",
+                    ).first()
+                    if pending_captcha and not allow_captcha_retry:
+                        skipped += 1
+                        log.info(
+                            "Skipping request %s: unresolved CAPTCHA challenge",
+                            req_id,
+                        )
+                        continue
                     # Skip brokers that are disabled (by an admin or auto-disabled
                     # by the health monitor) — a broken broker never crashes or
                     # slows a run; it's quietly passed over until reviewed.
@@ -1337,9 +1484,14 @@ async def run_optout_batch(request_ids: list[int]) -> dict:
                         halted_offline = True
                         break
 
-                    # Fresh context (new UA) per request/broker
-                    context = await _fresh_context(browser)
+                    # Email-only opt-outs do not require a browser context.
+                    # Keep the configured proxy for browser-based workflows.
+                    context = None
                     try:
+                        if req.broker.method != OptOutMethod.email:
+                            if browser is None:
+                                browser, _ = await _launch_browser(p)
+                            context = await _fresh_context(browser)
                         ok = await execute_optout(req, context, cfg, db)
                         if ok:
                             sent += 1
@@ -1362,10 +1514,12 @@ async def run_optout_batch(request_ids: list[int]) -> dict:
                         errors.append(f"Request {req_id}: {e}")
                         failed += 1
                     finally:
-                        await context.close()
+                        if context is not None:
+                            await context.close()
                     await asyncio.sleep(2)
             finally:
-                await browser.close()
+                if browser is not None:
+                    await browser.close()
     except Exception as e:
         errors.append(str(e))
     finally:

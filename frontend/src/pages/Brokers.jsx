@@ -4,6 +4,7 @@ import api from '../api'
 import { useAuth, can } from '../hooks/useAuth'
 import Badge, { plainLabel } from '../components/Badge'
 import PrivacyPagesPanel from '../components/PrivacyPagesPanel'
+import WebsiteCandidatesPanel from '../components/WebsiteCandidatesPanel'
 import BrokerTimelines from '../components/RemovalTimeline'
 import { tx, txn } from '../i18n/tx'
 import { fmtDate } from '../i18n/format'
@@ -257,6 +258,7 @@ export default function Brokers() {
         </table>
         </div>
       </div>
+      {canManage && <WebsiteCandidatesPanel />}
       {canManage && <PrivacyPagesPanel refreshKey={ppKey} />}
     </div>
   )

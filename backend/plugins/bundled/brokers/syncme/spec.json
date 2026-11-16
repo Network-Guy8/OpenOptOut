@@ -16,8 +16,8 @@
     },
     {
       "kind": "solve_captcha",
-      "selector": "iframe[src*='recaptcha']",
-      "optional": true
+      "selector": "iframe[src*='challenges.cloudflare.com']",
+      "optional": false
     },
     {
       "kind": "submit"

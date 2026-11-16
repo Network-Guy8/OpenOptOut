@@ -189,6 +189,33 @@ def create_request(
     if not broker: raise HTTPException(404, "That site is gone. Refresh the page.")
     if not member: raise HTTPException(404, "That person is gone. Refresh the page.")
 
+    existing = db.query(RemovalRequest).filter(
+        RemovalRequest.member_id == data.member_id,
+        RemovalRequest.broker_id == data.broker_id,
+    ).order_by(RemovalRequest.created_at.desc()).first()
+
+    if existing:
+        if (existing.status == RequestStatus.confirmed
+                and existing.recheck_after is not None
+                and datetime.utcnow() >= existing.recheck_after
+                and data.listing_url):
+            existing.status = RequestStatus.pending
+            existing.confirmed_at = None
+            existing.sent_at = None
+            existing.listing_url = data.listing_url
+            existing.notes = data.notes or existing.notes
+            db.commit()
+            db.refresh(existing)
+            return _to_out(existing)
+
+        status = getattr(existing.status, "value", existing.status)
+        raise HTTPException(
+            409,
+            f"An existing request already exists for this person and broker "
+            f"(request #{existing.id}, status: {status}). "
+            "Reuse that request rather than creating a duplicate."
+        )
+
     req = RemovalRequest(
         member_id=data.member_id,
         broker_id=data.broker_id,
@@ -246,6 +273,20 @@ def requeue_request(
     req = db.query(RemovalRequest).filter(RemovalRequest.id == req_id).first()
     if not req: raise HTTPException(404, "That request is gone. Refresh the page.")
     assert_can_edit(db, current_user, req.member_id)
+
+    # A completed removal cannot be automatically reopened before
+    # its scheduled recheck date.
+    if req.status != RequestStatus.confirmed:
+        raise HTTPException(
+            409,
+            "Only confirmed removals can be requeued after their recheck date."
+        )
+
+    if req.recheck_after is None or datetime.utcnow() < req.recheck_after:
+        raise HTTPException(
+            409,
+            "This removal is still within its 90-day recheck period."
+        )
 
     req.status       = RequestStatus.pending
     req.sent_at      = None

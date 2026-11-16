@@ -277,6 +277,21 @@ def validate_listing_url(url: str) -> str:
         raise ValueError("That's a search results page. Open the result and paste the address of the page itself.")
     if len(u) > 2000:
         raise ValueError("That web address is too long.")
+
+    # Generic informational pages are not personal data listings.
+    # Apply this to both manual additions and automatic search results.
+    generic_paths = {
+        "/about", "/about-us", "/about-callapp",
+        "/contact", "/contact-us",
+        "/privacy", "/privacy-policy",
+        "/terms", "/terms-of-service",
+        "/cookie-policy", "/cookies",
+        "/faq", "/help",
+    }
+    path = parsed.path.rstrip("/").lower() or "/"
+    if path in generic_paths:
+        raise ValueError("That is a general information page, not a personal listing.")
+
     return u
 
 
@@ -339,6 +354,24 @@ def add_listing(db, member, url: str, create_unknown: bool = True, source: str =
     from ..models.database import Broker, DiscoveryResult, RemovalRequest, RequestStatus, OptOutMethod
 
     clean = validate_listing_url(url)
+
+    # KEEP_LISTING_V1: a confirmed public listing must not
+    # accidentally enter the removal cycle.
+    from ..models.database import WebSearchHit
+    from .web_search import _url_hash
+
+    kept = db.query(WebSearchHit).filter(
+        WebSearchHit.member_id == member.id,
+        WebSearchHit.url_hash == _url_hash(clean),
+        WebSearchHit.status == "dismissed",
+        WebSearchHit.dismiss_reason == "keep_listing",
+    ).first()
+
+    if kept is not None:
+        raise ValueError(
+            "This page is marked Keep Listing. Undo that decision before adding it to removals."
+        )
+
     hit = resolve_broker(db, clean)
     broker, created = hit["broker"], False
 
@@ -361,11 +394,9 @@ def add_listing(db, member, url: str, create_unknown: bool = True, source: str =
                            snippet=("Added by a family member" if source == "manual"
                                     else "Found by web search"), scanned_at=datetime.utcnow()))
 
-    open_statuses = [RequestStatus(s) for s in _OPEN_STATUSES if s in RequestStatus.__members__]
     req = db.query(RemovalRequest).filter(
         RemovalRequest.member_id == member.id,
         RemovalRequest.broker_id == broker.id,
-        RemovalRequest.status.in_(open_statuses),
     ).order_by(RemovalRequest.created_at.desc()).first()
 
     if req is None:
@@ -377,11 +408,22 @@ def add_listing(db, member, url: str, create_unknown: bool = True, source: str =
         db.add(req)
         state = "added"
     else:
-        if not req.listing_url:
+        if (req.status == RequestStatus.confirmed
+                and req.recheck_after is not None
+                and datetime.utcnow() >= req.recheck_after):
+            req.status = RequestStatus.pending
+            req.confirmed_at = None
+            req.sent_at = None
             req.listing_url = clean
-        elif clean not in (req.listing_url or "") and clean not in (req.notes or ""):
-            req.notes = ((req.notes or "") + f"\nAnother listing: {clean}").strip()
-        state = "already_open"
+            req.notes = ((req.notes or "") +
+                         f"\nNew listing found after 90-day recheck: {clean}").strip()
+            state = "reopened"
+        else:
+            if not req.listing_url:
+                req.listing_url = clean
+            elif clean not in (req.listing_url or "") and clean not in (req.notes or ""):
+                req.notes = ((req.notes or "") + f"\nAnother listing: {clean}").strip()
+            state = "already_open"
 
     if not created and broker.method == OptOutMethod.manual and req.status == RequestStatus.pending \
             and (broker.origin or "curated") != "state_program":

@@ -145,7 +145,7 @@ def get_discovery_results(
 ):
     """Get discovery scan results for a member."""
     assert_can_view(db, current_user, member_id)
-    q = db.query(DiscoveryResult).filter(DiscoveryResult.member_id == member_id)
+    q = db.query(DiscoveryResult).filter(DiscoveryResult.member_id == member_id).filter(DiscoveryResult.broker.has(enabled=True))
     if found_only:
         q = q.filter(DiscoveryResult.found == True)
     results = q.order_by(DiscoveryResult.scanned_at.desc()).all()
@@ -198,7 +198,7 @@ def trigger_single_optout(
 
     def run():
         from ..core.optout_engine import run_optout_batch
-        asyncio.run(run_optout_batch([request_id]))
+        asyncio.run(run_optout_batch([request_id], allow_captcha_retry=True))
 
     threading.Thread(target=run, daemon=True).start()
     return {"triggered": True, "request_id": request_id}

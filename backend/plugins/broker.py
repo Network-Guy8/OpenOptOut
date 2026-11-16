@@ -107,7 +107,7 @@ class CapabilityBroker:
         # Broker read / request lifecycle / email trigger / fetch / scheduling.
         self.extended = extended
         # plugin_id -> set(declared outbound_domains), for http_fetch enforcement.
-        self.plugin_outbound_domains = plugin_outbound_domains or {}
+        self.plugin_outbound_domains = plugin_outbound_domains if plugin_outbound_domains is not None else {}
         # plugin_id -> its own confirmed provider_key (e.g. "gmail"), for
         # email_credentials_get's cross-provider guard below.
         self.email_provider_key_lookup = email_provider_key_lookup or (lambda pid: None)

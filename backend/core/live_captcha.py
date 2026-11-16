@@ -326,17 +326,27 @@ def finish_step(db, req, res, user_id: int, now: Optional[datetime] = None) -> N
     from .settings_store import load_settings
     now = now or datetime.utcnow()
     if res.ok:
+        human_confirmed = bool(
+            getattr(res, "human_confirmed_submission", False)
+            and not getattr(res, "verified", False)
+        )
         req.status = RequestStatus.sent
         req.sent_at = now
         days = load_settings().get("scheduler", {}).get("recheck_interval_days", 90)
         req.recheck_after = now + timedelta(days=days)
-        req.notes = "Finished live: a person did the step that needed them, and OpenOptOut sent the rest."
+        req.notes = (
+            "Human-confirmed submission. Broker confirmation pending; "
+            "receipt and processing have not been independently verified."
+            if human_confirmed else
+            "Finished live: a person did the step that needed them, and OpenOptOut sent the rest."
+        )
         req.handoff_enc = None
-        try:
-            from .broker_health import record_success
-            record_success(db, req.broker_id)
-        except Exception:
-            pass
+        if not human_confirmed:
+            try:
+                from .broker_health import record_success
+                record_success(db, req.broker_id)
+            except Exception:
+                pass
     elif res.needs_manual and res.human_instruction:
         req.notes = res.human_instruction     # a different step now needs them
     db.add(AutomationLog(request_id=req.id, member_id=req.member_id, broker_id=req.broker_id,

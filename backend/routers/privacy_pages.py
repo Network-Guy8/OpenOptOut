@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ..models.database import get_db, User, Broker, PrivacyPage, SessionLocal
+from ..models.database import get_db, User, Broker, PrivacyPage, SessionLocal, BrokerWebsiteCandidate
 from ..core.access import require_permission
 from ..core import privacy_finder as pf
 
@@ -26,7 +26,7 @@ _LOCK = threading.Lock()
 def _out(p: PrivacyPage, names: dict) -> dict:
     return {"id": p.id, "broker_id": p.broker_id, "broker_name": names.get(p.broker_id, ""),
             "url": p.url, "kind": p.kind, "label": p.label, "status": p.status,
-            "fillable": p.kind in pf.FILLABLE,
+            "fillable": pf.is_automation_eligible(p),
             "found_at": p.found_at.isoformat() if p.found_at else None}
 
 
@@ -94,3 +94,123 @@ def approve_email(page_id: int, db: Session = Depends(get_db), user: User = Depe
         raise HTTPException(400, "Only email addresses can be approved.")
     addr = pf.approve_email(db, p, user.full_name or user.email)
     return {"ok": True, "message": f"Email opt-outs for this broker will go to {addr}."}
+
+
+# ── Broker website candidate review ─────────────────────────────────────────
+
+@router.get("/website-candidates")
+def list_website_candidates(
+    status: str = Query("pending"),
+    db: Session = Depends(get_db),
+    _=Depends(_manage),
+):
+    if status not in ("pending", "approved", "dismissed", "all"):
+        raise HTTPException(400, "Invalid status")
+
+    q = db.query(BrokerWebsiteCandidate, Broker).join(
+        Broker, BrokerWebsiteCandidate.broker_id == Broker.id
+    )
+
+    if status != "all":
+        q = q.filter(BrokerWebsiteCandidate.status == status)
+
+    rows = q.order_by(
+        BrokerWebsiteCandidate.broker_id,
+        BrokerWebsiteCandidate.id
+    ).limit(1000).all()
+
+    return {
+        "candidates": [
+            {
+                "id": c.id,
+                "broker_id": b.id,
+                "broker_name": b.name,
+                "url": c.url,
+                "source": c.source,
+                "status": c.status,
+                "approved_website": b.website,
+            }
+            for c, b in rows
+        ]
+    }
+
+
+@router.post("/website-candidates/{candidate_id}/approve")
+def approve_website_candidate(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(_manage),
+):
+    from ..core.privacy_finder import verified_broker_domain
+
+    candidate = db.query(BrokerWebsiteCandidate).filter(
+        BrokerWebsiteCandidate.id == candidate_id
+    ).first()
+
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+
+    if candidate.status == "dismissed":
+        raise HTTPException(409, "Dismissed candidate cannot be approved")
+
+    broker = db.query(Broker).filter(
+        Broker.id == candidate.broker_id
+    ).first()
+
+    if not broker:
+        raise HTTPException(404, "Broker not found")
+
+    old_website = broker.website
+    broker.website = candidate.url
+
+    if not verified_broker_domain(broker):
+        broker.website = old_website
+        raise HTTPException(400, "Candidate is not a valid website")
+
+    candidate.status = "approved"
+
+    # Keep only one approved candidate per broker.
+    others = db.query(BrokerWebsiteCandidate).filter(
+        BrokerWebsiteCandidate.broker_id == broker.id,
+        BrokerWebsiteCandidate.id != candidate.id,
+        BrokerWebsiteCandidate.status == "approved"
+    ).all()
+
+    for other in others:
+        other.status = "dismissed"
+
+    # A new website can be checked by the privacy finder.
+    broker.privacy_checked_at = None
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "broker": broker.name,
+        "website": broker.website,
+        "previous_website": old_website,
+    }
+
+
+@router.post("/website-candidates/{candidate_id}/dismiss")
+def dismiss_website_candidate(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(_manage),
+):
+    candidate = db.query(BrokerWebsiteCandidate).filter(
+        BrokerWebsiteCandidate.id == candidate_id
+    ).first()
+
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+
+    if candidate.status == "approved":
+        raise HTTPException(
+            409, "Approved websites must be replaced before dismissal"
+        )
+
+    candidate.status = "dismissed"
+    db.commit()
+
+    return {"ok": True, "candidate_id": candidate_id}

@@ -207,13 +207,17 @@ def spec_for_page(broker, page) -> BrokerSpec:
     steps = [
         Step(kind="navigate", url=page.url, timeout_ms=30000),
         Step(kind="wait", timeout_ms=2500),     # hosted forms render with script
-        Step(kind="frame", selector="iframe[src*='onetrust'], iframe[src*='trustarc']", optional=True)
-        if page.kind == "request_form" else None,
         Step(kind="autofill"),
         Step(kind="solve_captcha", selector="iframe[src*='recaptcha'], .h-captcha", optional=True),
-        Step(kind="click_matching", selector="button, input[type=submit]", text="Submit"),
-        Step(kind="wait", timeout_ms=3000),
-        Step(kind="expect_success", text="received", optional=True, timeout_ms=10000),
+        Step(
+            kind="pause_for_human",
+            text=(
+                "Review the completed privacy request form and submit it on "
+                "the broker's website. Only press 'I've done this step' AFTER "
+                "submitting the request. This records your submission as Sent; "
+                "broker confirmation remains pending."
+            ),
+        ),
     ]
     return BrokerSpec(
         broker_id=slug, name=broker.name, method="form", opt_out_url=page.url,

@@ -160,9 +160,19 @@ def allowed_domains(db, req) -> set:
         # Hosted privacy forms (OneTrust, TrustArc) send their own verification links.
         try:
             from ..models.database import PrivacyPage
-            cands += [p.url for p in db.query(PrivacyPage).filter(
-                PrivacyPage.broker_id == b.id, PrivacyPage.status.in_(("active", "approved")),
-                PrivacyPage.kind.in_(("hosted_onetrust", "hosted_trustarc", "request_form"))).all()]
+            from .privacy_finder import is_automation_eligible
+            cands += [
+                p.url for p in db.query(PrivacyPage).filter(
+                    PrivacyPage.broker_id == b.id,
+                    PrivacyPage.status.in_(("active", "approved")),
+                    PrivacyPage.kind.in_((
+                        "hosted_onetrust",
+                        "hosted_trustarc",
+                        "request_form",
+                    ))
+                ).all()
+                if is_automation_eligible(p)
+            ]
         except Exception:
             pass
     for c in cands:

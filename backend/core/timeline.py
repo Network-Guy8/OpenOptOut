@@ -34,6 +34,7 @@ LABELS = {
     "captcha_done": "CAPTCHA finished",
     "refused": "The site refused",
     "failed": "Didn't work",
+    "skipped": "Skipped",
     "queued": "Waiting to send",
 }
 STAGES = ["sent", "reply", "removed", "watching"]
@@ -52,7 +53,7 @@ def raw_events(db, req) -> list:
     for e in db.query(RequestEvent).filter(RequestEvent.request_id == req.id).all():
         kind = {"sent": "sent", "submitted": "sent", "confirmed": "removed", "recheck_due": "check_due",
                 "needs_manual": "needs_you", "rejected": "refused", "failed": "failed",
-                "pending": "queued"}.get(e.to_status)
+                "pending": "queued", "skipped": "skipped"}.get(e.to_status)
         if kind == "sent" and e.from_status == "needs_manual":
             out.append(_ev(e.at, "sent", "done by a person"))
         elif kind:

@@ -103,6 +103,37 @@ def _same_site(url: str, domain: str) -> bool:
     return h == domain or h.endswith("." + domain)
 
 
+def normalize_finding_url(url: str) -> str:
+    """Canonicalize discovery URLs without changing existing DB records."""
+    from urllib.parse import urlsplit, urlunsplit, unquote
+
+    url = _html.unescape((url or "").strip())
+
+    if url.lower().startswith("mailto:"):
+        addr = unquote(url[7:].split("?")[0]).strip().lower()
+        addr = re.sub(r"^(?:u003e)+(?=(?:privacy|dpo|optout|opt-out|"
+                      r"dsar|ccpa|gdpr|removal|remove|delete|legal))",
+                      "", addr, flags=re.I)
+        if not EMAIL_RE.fullmatch(addr):
+            return ""
+        return "mailto:" + addr
+
+    try:
+        p = urlsplit(url)
+        if p.scheme.lower() != "https" or not p.hostname:
+            return ""
+        if p.username or p.password:
+            return ""
+        host = p.hostname.lower().rstrip(".")
+        port = p.port
+        if port and port != 443:
+            host += ":" + str(port)
+        path = p.path.rstrip("/") or "/"
+        return urlunsplit(("https", host, path, p.query, ""))
+    except (ValueError, TypeError):
+        return ""
+
+
 def links_in(page_html: str, base_url: str) -> list:
     """[(absolute url, text)] for every link and iframe on a page."""
     out, seen = [], set()
@@ -134,6 +165,11 @@ def privacy_emails(page_html: str, domain: str) -> list:
     """Privacy-looking addresses on the broker's own domain."""
     found = []
     for local, dom in EMAIL_RE.findall(_html.unescape(page_html or "")):
+        local = re.sub(
+            r"^(?:u003e)+(?=(?:privacy|dpo|optout|opt-out|dsar|"
+            r"ccpa|gdpr|removal|remove|delete|legal))",
+            "", local, flags=re.I
+        )
         addr = f"{local}@{dom}".lower()
         if (dom.lower() == domain or dom.lower().endswith("." + domain)) and PRIVACY_LOCAL.search(local) \
                 and addr not in found:
@@ -142,21 +178,71 @@ def privacy_emails(page_html: str, domain: str) -> list:
 
 
 def classify_page(url: str, page_html: str) -> str:
-    """What a fetched page is: a hosted form, a request form, an opt-out page, a policy, or ''."""
+    """Classify using page purpose, not unrelated footer links."""
     hk = hosted_kind(url)
     if hk:
         return hk
+
+    path = urlparse(url).path.lower().rstrip("/")
     body = page_html or ""
     text = _text(body)
-    has_form = bool(re.search(r"<form\b", body, re.I)) or "type=\"email\"" in body.lower()
-    asks_email = bool(re.search(r"type\s*=\s*[\"']email|name\s*=\s*[\"'][^\"']*e-?mail", body, re.I))
-    if has_form and asks_email and FORM_TALK.search(text):
-        return "request_form"
-    if re.search(r"do not sell|do not share|opt[\s-]*out|privacy request|delete your|request (the )?deletion",
-                 text, re.I):
-        return "optout_page"
-    if re.search(r"privacy (policy|notice)", text, re.I):
+    title_match = _TITLE.search(body)
+    title = _text(title_match.group(1)) if title_match else ""
+
+    # General policy pages are reference material, not request forms.
+    if re.search(
+        r"(?:privacy-policy|privacy-notice|privacy\.html|"
+        r"resources-privacy|/legal/privacy)",
+        path
+    ) and not re.search(r"/(?:remove|request-removal|optout|opt-out)", path):
         return "policy"
+
+    has_form = bool(re.search(r"<form\\b", body, re.I))
+    asks_email = bool(re.search(
+        r"type\\s*=\\s*[\\\"']email|"
+        r"name\\s*=\\s*[\\\"'][^\\\"']*e-?mail",
+        body, re.I
+    ))
+
+    dedicated = bool(re.search(
+        r"opt[\s_-]?out|do-not-sell|do-not-share|"
+        r"unlist|request-removal|privacy-rights-request|"
+        r"personaldata/optout|/removal|/remove(?:/|$)|"
+        r"your-privacy-choices",
+        path
+    ))
+
+    if dedicated:
+        if has_form and asks_email and FORM_TALK.search(text):
+            return "request_form"
+        return "optout_page"
+
+    # A generic homepage form plus privacy text is not a DSAR form.
+    if not path or path == "/":
+        return ""
+
+    purpose = bool(re.search(
+        r"privacy.request|data.request|delete.your|"
+        r"request.deletion|opt.out|do.not.sell",
+        title, re.I
+    ))
+
+    if has_form and asks_email and purpose and FORM_TALK.search(text):
+        return "request_form"
+
+    if re.search(
+        r"privacy-rights|privacy-request|privacy-choices|"
+        r"privacy/control|privacy-center|control-your-profile",
+        path
+    ):
+        return "optout_page"
+
+    if purpose:
+        return "optout_page"
+
+    if re.search(r"privacy (policy|notice)", title, re.I):
+        return "policy"
+
     return ""
 
 
@@ -201,9 +287,13 @@ def find(domain: str, fetch=None) -> dict:
     findings, seen_pages, fetched, blocked = {}, set(), 0, False
 
     def add(url, kind, label, score):
-        key = (url.split("#")[0].rstrip("/"), kind)
+        url = normalize_finding_url(url.split("#")[0])
+        if not url:
+            return
+        key = url
         if key not in findings or findings[key]["score"] < score:
-            findings[key] = {"url": url.split("#")[0], "kind": kind, "label": (label or "")[:300], "score": score}
+            findings[key] = {"url": url, "kind": kind,
+                             "label": (label or "")[:300], "score": score}
 
     def visit(url):
         nonlocal fetched, blocked
@@ -266,24 +356,80 @@ def find(domain: str, fetch=None) -> dict:
 
 # ── Saving and using results ──────────────────────────────────────────────────
 
+
+def verified_broker_domain(broker):
+    """Extract a valid hostname from the broker's approved website."""
+    from urllib.parse import urlparse
+    import re
+
+    website = (getattr(broker, "website", None) or "").strip()
+    if not website:
+        return ""
+
+    parsed = urlparse(
+        website if "://" in website else "https://" + website
+    )
+
+    if parsed.scheme not in ("http", "https"):
+        return ""
+
+    if parsed.username or parsed.password:
+        return ""
+
+    try:
+        if parsed.port not in (None, 80, 443):
+            return ""
+    except ValueError:
+        return ""
+
+    host = (parsed.hostname or "").lower().rstrip(".")
+
+    if not host or len(host) > 253 or "." not in host:
+        return ""
+
+    if not re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+        host,
+    ):
+        return ""
+
+    if host.endswith((".local", ".internal", ".localhost", ".test")):
+        return ""
+
+    return host
+
+
+
 def run_for_broker(db, broker, fetch=None, now=None) -> dict:
     from ..models.database import PrivacyPage
     from .listing_finder import broker_domain, registrable_domain
     now = now or datetime.utcnow()
-    host = broker_domain(broker)
+    host = verified_broker_domain(broker)
     if not host:
         return {"findings": [], "fetched": 0, "blocked": False, "error": "no website for this broker"}
     domain = registrable_domain(host)
     res = find(domain, fetch=fetch)
-    existing = {(p.url, p.kind): p for p in db.query(PrivacyPage).filter(PrivacyPage.broker_id == broker.id).all()}
+    existing = {}
+    for page in db.query(PrivacyPage).filter(
+        PrivacyPage.broker_id == broker.id
+    ).order_by(PrivacyPage.id).all():
+        key = normalize_finding_url(page.url)
+        if key:
+            existing.setdefault(key, page)
+
     new = []
     for f in res["findings"]:
-        row = existing.get((f["url"], f["kind"]))
+        key = normalize_finding_url(f["url"])
+        if not key:
+            continue
+        row = existing.get(key)
         if row is None:
             db.add(PrivacyPage(broker_id=broker.id, url=f["url"][:1000], kind=f["kind"],
                                label=f["label"], score=f["score"], found_at=now))
             new.append(f)
-        elif row.status != "dismissed":
+            existing[key] = True
+        elif row is not True and row.status != "dismissed":
             row.label, row.score, row.found_at = f["label"], f["score"], now
     broker.privacy_checked_at = now
     _note_found(db, broker, new)
@@ -323,12 +469,112 @@ def _note_found(db, broker, new: list) -> None:
            broker_id=broker.id)
 
 
+
+def is_automation_eligible(page) -> bool:
+    """Conservative eligibility check for discovered privacy forms.
+
+    This does not prove a form works or authorize submission.
+    It excludes clearly inappropriate legacy discoveries.
+    """
+    from urllib.parse import urlparse
+
+    if getattr(page, "status", "active") not in ("active", "approved"):
+        return False
+
+    kind = getattr(page, "kind", "")
+    if kind not in FILLABLE:
+        return False
+
+    url = normalize_finding_url(getattr(page, "url", "") or "")
+
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            return False
+
+        path = parsed.path.lower().rstrip("/")
+        host = parsed.hostname.lower()
+    except (ValueError, TypeError):
+        return False
+
+    # Hosted services must match their recognized provider.
+    if kind in ("hosted_onetrust", "hosted_trustarc"):
+        if hosted_kind(url) != kind:
+            return False
+
+        # Never submit to the provider's generic landing page.
+        if not path:
+            return False
+
+        if kind == "hosted_onetrust":
+            return (
+                "/webform/" in path
+                or "/request/" in path
+                or "/form/" in path
+                or "/dsar/" in path
+            )
+
+        return (
+            "/form/" in path
+            or "/request/" in path
+            or "/consumer/" in path
+            or "/privacy/" in path
+            or "/irm/" in path
+        )
+
+    # Legacy request_form entries are not trustworthy solely
+    # because their stored kind says request_form.
+    if not path:
+        return False
+
+    if any(part in path for part in (
+        "privacy-policy",
+        "privacy-notice",
+        "privacy.html",
+        "resources-privacy",
+        "/legal/privacy",
+        "/application-privacy",
+        "/privacy/policy",
+        "/uas/login",
+    )):
+        # A dedicated removal path can legitimately sit beneath
+        # a privacy-policy prefix, e.g. /privacy-policy/remove.
+        if not any(part in path for part in (
+            "/remove", "/optout", "/opt-out",
+            "/request-removal",
+        )):
+            return False
+
+    # Require a dedicated privacy-rights action in the URL.
+    return any(part in path for part in (
+        "optout",
+        "opt-out",
+        "opt_out",
+        "request-removal",
+        "privacy-rights-request",
+        "personaldata/optout",
+        "do-not-sell",
+        "do-not-share",
+        "/unlist",
+        "/remove",
+        "/removal",
+        "/dsar",
+        "/data-deletion",
+        "/delete-my-data",
+    ))
+
+
 def best(db, broker, kinds=None):
     """The best active finding for this broker (optionally of these kinds)."""
     from ..models.database import PrivacyPage
     rows = db.query(PrivacyPage).filter(PrivacyPage.broker_id == broker.id,
                                         PrivacyPage.status.in_(("active", "approved"))).all()
-    rows = [r for r in rows if r.kind != "email" and (kinds is None or r.kind in kinds)]
+    rows = [
+        r for r in rows
+        if r.kind != "email"
+        and (kinds is None or r.kind in kinds)
+        and (r.kind not in FILLABLE or is_automation_eligible(r))
+    ]
     rows.sort(key=lambda r: (PRIORITY.get(r.kind, 9), -(r.score or 0)))
     return rows[0] if rows else None
 
@@ -336,6 +582,7 @@ def best(db, broker, kinds=None):
 def needs_check(db, limit: int = 20, now=None) -> list:
     """Brokers with no opt-out steps whose site hasn't been looked at lately."""
     from ..models.database import Broker, BrokerScript, BrokerHealth, OptOutMethod
+    from .listing_finder import broker_domain
     now = now or datetime.utcnow()
     scripted = {s.broker_id for s in db.query(BrokerScript).all()}
     defunct = {h.broker_id for h in db.query(BrokerHealth).filter(BrokerHealth.defunct.is_(True)).all()}
@@ -344,6 +591,8 @@ def needs_check(db, limit: int = 20, now=None) -> list:
         if b.plugin_id or b.id in scripted or b.id in defunct or (b.origin or "") == "state_program":
             continue
         if b.method == OptOutMethod.email:
+            continue
+        if not verified_broker_domain(b):
             continue
         if b.privacy_checked_at and now - b.privacy_checked_at < timedelta(days=RECHECK_DAYS):
             continue
@@ -380,7 +629,7 @@ def check_new_site(db, broker, fetch=None) -> dict:
         return res
     waiting = db.query(RemovalRequest).filter(RemovalRequest.broker_id == broker.id,
                                               RemovalRequest.status == RequestStatus.needs_manual).all()
-    if page.kind in FILLABLE and ours:
+    if is_automation_eligible(page) and ours:
         broker.method = OptOutMethod.form
         broker.opt_out_url = page.url
         for r in waiting:
@@ -396,13 +645,55 @@ def check_new_site(db, broker, fetch=None) -> dict:
 
 
 def approve_email(db, page, who: str):
-    """An admin confirmed a found address: use it for this broker's email opt-outs."""
-    from ..models.database import Broker
+    """Approve a verified opt-out email and enable eligible email opt-outs."""
+    from ..models.database import (
+        Broker, RemovalRequest, RequestStatus, OptOutMethod,
+    )
+    from .listing_finder import UNKNOWN_BROKER_NOTE
+
     addr = page.url[7:] if page.url.startswith("mailto:") else page.url
     b = db.query(Broker).filter(Broker.id == page.broker_id).first()
-    note = f"Opt-out email {addr} (found on its website, approved by {who} on {datetime.utcnow():%Y-%m-%d})"
-    # The engine reads the first address in a broker's notes, so this one goes first.
-    b.notes = note + ("\n" + b.notes if b.notes else "")
+    if b is None:
+        raise ValueError("Broker not found")
+
+    # Only promote unknown, manual-only brokers.
+    # Never replace an existing form or plugin workflow.
+    was_unknown = UNKNOWN_BROKER_NOTE[:40] in (b.notes or "")
+    promote = (
+        b.method == OptOutMethod.manual
+        and was_unknown
+        and not b.plugin_id
+    )
+
+    note = (
+        f"Opt-out email {addr} (found on its website, "
+        f"approved by {who} on {datetime.utcnow():%Y-%m-%d})"
+    )
+
+    if note not in (b.notes or ""):
+        b.notes = note + ("\n" + b.notes if b.notes else "")
+
     page.status = "approved"
+
+    if promote:
+        b.method = OptOutMethod.email
+
+        waiting = db.query(RemovalRequest).filter(
+            RemovalRequest.broker_id == b.id,
+            RemovalRequest.status == RequestStatus.needs_manual,
+        ).all()
+
+        for r in waiting:
+            # Only requeue requests waiting for an unknown opt-out method.
+            if (
+                "doesn't know how to opt out" in (r.notes or "")
+                or "Ask " + b.name + " to delete" in (r.notes or "")
+            ):
+                r.status = RequestStatus.pending
+                r.notes = (
+                    f"Approved opt-out email: {addr}. "
+                    "Queued for automated email submission."
+                )
+
     db.commit()
     return addr

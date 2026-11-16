@@ -80,15 +80,41 @@ function Round({ c, n, stages, open: startOpen }) {
   )
 }
 
-export function RemovalTimeline({ t }) {
+export function RemovalTimeline({ t, onRetry }) {
+  const [retrying, setRetrying] = useState(false)
+  const [retryError, setRetryError] = useState('')
+
+  const retryFailedRequest = async () => {
+    if (retrying) return
+    setRetrying(true)
+    setRetryError('')
+    try {
+      await api.post(`/timeline/request/${t.request_id}/retry`)
+      await onRetry()
+    } catch (e) {
+      setRetryError(detailText(e) || tx("Couldn't retry this request."))
+    } finally {
+      setRetrying(false)
+    }
+  }
+
   const rounds = t.cycles
   return (
     <div className="bg-slate-900/60 rounded-lg border border-slate-700/50 p-3">
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <span className="text-white text-sm font-medium">{t.member}</span>
         <Badge value={t.status} />
+        {t.status === 'failed' && (
+          <button type="button" onClick={retryFailedRequest}
+            disabled={retrying}
+            className="inline-flex items-center gap-1 rounded border border-slate-500 px-2 py-1 text-xs text-slate-200 hover:bg-slate-700 disabled:opacity-50">
+            <RotateCcw size={12} aria-hidden="true" />
+            {retrying ? tx("Retrying…") : tx("Retry")}
+          </button>
+        )}
         {t.next_check && <span className="text-slate-400 text-xs">{tx("Next check")}{" "}{fmt(t.next_check)}</span>}
       </div>
+      {retryError && <p role="alert" className="mb-3 text-red-400 text-sm">{retryError}</p>}
       {t.overdue && (
         <p className="mb-3 flex items-start gap-1.5 text-red-300 text-sm" role="note">
           <AlertTriangle size={14} className="shrink-0 mt-0.5" aria-hidden="true" />
@@ -109,13 +135,16 @@ export function RemovalTimeline({ t }) {
 export default function BrokerTimelines({ brokerId }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
+  const reload = async () => {
+    const response = await api.get(`/timeline/broker/${brokerId}`)
+    setData(response.data)
+    setError('')
+  }
   useEffect(() => {
-    api.get(`/timeline/broker/${brokerId}`)
-      .then(r => setData(r.data))
-      .catch(e => setError(detailText(e) || tx("Couldn't load the history.")))
+    reload().catch(e => setError(detailText(e) || tx("Couldn't load the history.")))
   }, [brokerId])
   if (error) return <p role="alert" className="text-red-400 text-sm">{error}</p>
   if (!data) return <p className="text-slate-400 text-sm">{tx("Loading…")}</p>
   if (!data.timelines.length) return <p className="text-slate-400 text-sm">{tx("No one in your family has a request with {broker} yet.", { broker: data.broker })}</p>
-  return <div className="space-y-3">{data.timelines.map(t => <RemovalTimeline key={t.request_id} t={t} />)}</div>
+  return <div className="space-y-3">{data.timelines.map(t => <RemovalTimeline key={t.request_id} t={t} onRetry={reload} />)}</div>
 }

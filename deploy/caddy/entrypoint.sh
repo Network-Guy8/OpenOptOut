@@ -357,7 +357,7 @@ $HSTS_LINE
 		X-Frame-Options "DENY"
 		Cross-Origin-Opener-Policy "same-origin"
 		Cross-Origin-Resource-Policy "same-origin"
-		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; report-uri /api/csp-report; report-to csp-endpoint;"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; report-uri /api/csp-report; report-to csp-endpoint;"
 		Reporting-Endpoints \`csp-endpoint="/api/csp-report"\`
 		-Server
 	}

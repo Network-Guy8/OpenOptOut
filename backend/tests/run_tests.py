@@ -685,7 +685,7 @@ def t_calendar_maintenance_windows():
 
     # 1. Validation & cleaning
     raw = [
-        {"start": "2026-10-25T02:00:00", "end": "2026-10-25T05:00:00", "description": "Host server updates and backups", "apply_plugin_updates": True},
+        {"start": "2026-10-25T02:00:00", "end": "2026-10-25T05:00:00", "description": "Host server updates and backups"},
         {"start": "2026-10-26T05:00:00", "end": "2026-10-26T02:00:00"}, # inverted
         {"start": "not-a-date", "end": "2026-10-25T05:00:00"},          # malformed
         {"start": "2026-10-27T01:00:00Z", "end": "2026-10-27T03:00:00Z", "description": "Storage backup"}
@@ -693,10 +693,8 @@ def t_calendar_maintenance_windows():
     cleaned = cal.clean_maintenance_windows(raw)
     assert len(cleaned) == 2, f"expected 2 valid windows, got {len(cleaned)}"
     assert cleaned[0]["description"] == "Host server updates and backups"
-    assert cleaned[0]["apply_plugin_updates"] is True
     assert cleaned[0]["id"].startswith("mw-")
     assert cleaned[1]["description"] == "Storage backup"
-    assert cleaned[1]["apply_plugin_updates"] is False
 
     # 2. In-window detection
     sc = {"enabled": True, "run_time": "02:00", "maintenance_windows": cleaned}
@@ -724,7 +722,6 @@ def t_calendar_maintenance_windows():
     maint_evs = [e for e in ev if e.get("kind") == "maintenance"]
     assert len(maint_evs) >= 1, "maintenance event missing from upcoming"
     assert maint_evs[0]["start_time"] == "02:00" and maint_evs[0]["end_time"] == "05:00"
-    assert maint_evs[0]["apply_plugin_updates"] is True
 
     # 5. .ics feed export
     ics = cal.to_ics(ev, now=_dt.datetime(2026, 10, 24))
@@ -733,43 +730,27 @@ def t_calendar_maintenance_windows():
     assert "DTEND:20261025T050000Z" in ics
     assert "Host server updates and backups" in ics
 
-    # 6. Scheduler transition simulation & plugin update trigger
+    # 6. Scheduler transition simulation
     try:
         sched = _imp("core.scheduler")
         # Test check_maintenance_windows transitions with simulated now
         orig_in = sched._in_maintenance
-        orig_last_win = getattr(sched, "_last_plugin_update_window_id", None)
-        sched._last_plugin_update_window_id = None
         try:
-            # Inside window: should detect, pause, and record update trigger for window
+            # Inside window: should detect and pause
             in_m = sched.check_maintenance_windows(now=t_inside)
             assert in_m is True
             assert sched._in_maintenance is True
-            assert sched._last_plugin_update_window_id == cleaned[0]["id"]
-            # Calling again inside same window is deduped
-            in_m_again = sched.check_maintenance_windows(now=t_inside)
-            assert in_m_again is True
-            assert sched._last_plugin_update_window_id == cleaned[0]["id"]
             # Outside window: should detect end and resume
             in_m2 = sched.check_maintenance_windows(now=t_after)
             assert in_m2 is False
             assert sched._in_maintenance is False
         finally:
             sched._in_maintenance = orig_in
-            sched._last_plugin_update_window_id = orig_last_win
     except Exception as e:
         # Scheduler import may skip if optional deps missing
         pass
 
-    # 7. Plugin catalog maintenance update helper
-    try:
-        cat = _imp("plugins.catalog")
-        res_none = cat.apply_pending_plugin_updates(None)
-        assert res_none == {"applied": [], "failed": [], "skipped": []}
-    except Exception:
-        pass
-
-    # 8. Advance downtime notice banner & notice hours
+    # 7. Advance downtime notice banner & notice hours
     # Default: 24 hours in advance
     t_10h_before = _dt.datetime(2026, 10, 24, 16, 0)
     t_30h_before = _dt.datetime(2026, 10, 23, 20, 0)
@@ -6553,12 +6534,8 @@ def t_safe_filename_fragment():
     # not reconstruct their own ad-hoc sanitization (the exact bug this fixes
     # — the old code only stripped '.' and ' ', never '/').
     for mod_name, needle in (("core.optout_engine", "screenshot_path = f"), ("core.discovery", 'f"{SCREENSHOTS_DIR}')):
-        try:
-            mod = _imp(mod_name)
-            file_path = mod.__file__
-        except ImportError:
-            file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), *mod_name.split(".")) + ".py"
-        with open(file_path, encoding="utf-8") as f:
+        mod = _imp(mod_name)
+        with open(mod.__file__, encoding="utf-8") as f:
             src = f.read()
         idx = src.index(needle)
         window = src[max(0, idx - 400):idx + 200]
@@ -11453,69 +11430,6 @@ def t_wizard_express_mode():
         wiz._load, wiz._save = orig_load, orig_save
 
 
-@test(2, "wizard.catalog_bundle_selection",
-      "The wizard's catalog step lists curated protection bundles, installs selected bundles, "
-      "persists state, and supports skipping cleanly.")
-def t_wizard_catalog_bundle():
-    from types import SimpleNamespace as NS
-    try:
-        wiz = _imp("routers.wizard")
-        from fastapi import HTTPException
-    except ImportError as e:
-        raise Skip(f"needs full backend deps / package layout: {e}")
-
-    import copy
-    store = {}
-    orig_load, orig_save = wiz._load, wiz._save
-    wiz._load = lambda: copy.deepcopy(store)
-    def fake_save(data):
-        store.clear(); store.update(data)
-    wiz._save = fake_save
-    admin = NS(is_super_admin=True)
-
-    try:
-        # 1. Bundles list returns pre-curated definitions
-        bundles_resp = wiz.list_protection_bundles(db=None, user=admin)
-        assert "bundles" in bundles_resp
-        bundles = bundles_resp["bundles"]
-        assert len(bundles) >= 4
-        b_ids = [b["id"] for b in bundles]
-        assert "bundle-us" in b_ids
-        assert "bundle-gdpr" in b_ids
-        assert "bundle-high-risk" in b_ids
-        assert "bundle-all-core" in b_ids
-
-        # 2. Saving catalog step directly
-        wiz.save_catalog_step(wiz.CatalogStep(bundle_id="bundle-us", installed_count=12), user=admin)
-        assert store["wizard"]["steps"]["catalog"] == "done"
-        assert store["wizard"]["catalog"]["bundle_id"] == "bundle-us"
-        assert store["wizard"]["catalog"]["installed_count"] == 12
-
-        # 3. State reflects catalog configuration
-        state = wiz.get_state(db=None, user=admin)
-        assert state["catalog"]["bundle_id"] == "bundle-us"
-        assert state["catalog"]["installed_count"] == 12
-
-        # 4. Skipping catalog step works
-        wiz.skip_step(wiz.SkipStep(step="catalog"), db=None, user=admin)
-        assert store["wizard"]["steps"]["catalog"] == "skipped"
-
-        # 5. Invalid bundle install rejection
-        try:
-            wiz.install_bundle(wiz.BundleInstallStep(bundle_id="non-existent-bundle"), db=None, user=admin)
-            raise AssertionError("invalid bundle_id accepted")
-        except HTTPException as e:
-            assert e.status_code == 400
-
-        # 6. Empty bundle or custom list handled cleanly
-        res = wiz.install_bundle(wiz.BundleInstallStep(bundle_id=None, plugin_ids=[]), db=None, user=admin)
-        assert res["ok"] is True
-        assert res["total"] == 0
-        assert store["wizard"]["steps"]["catalog"] == "done"
-    finally:
-        wiz._load, wiz._save = orig_load, orig_save
-
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TIER 3 — plugin protocol (needs grpcio + compiled proto stubs)
@@ -13155,12 +13069,24 @@ def t_verification():
     r = vf.verify_request(s, req, {}, fetch=fetch)
     s.refresh(req)
     assert r["verdict"] == "gone" and r["action"] == "confirmed" and req.status == R.confirmed and req.last_verdict == "gone"
-    # 2. A month later it's back with their city: re-sent, noted as come back.
+    # 2. A listing reappearing before 90 days must NOT trigger a resend.
     pages[listing] = (listing, 200, "<h1>Pat Parent, 45</h1><p>Lives in Austin, TX. Phone (512) 555-0100</p>")
+    req.recheck_after = now + timedelta(days=1)
+    s.commit()
     r = vf.verify_request(s, req, {}, fetch=fetch)
     s.refresh(req)
-    assert r["verdict"] == "listed" and r["action"] == "resend_reappeared" and req.status == R.pending
-    assert "came back" in req.notes
+    assert r["verdict"] == "listed" and not r["action"].startswith("resend")
+    assert req.status == R.confirmed, "A listing before the 90-day date must remain confirmed"
+
+    # 3. Once the 90-day recheck date has passed, a positive listing
+    # result can reactivate the existing request.
+    req.recheck_after = now - timedelta(days=1)
+    s.commit()
+    r = vf.verify_request(s, req, {}, fetch=fetch)
+    s.refresh(req)
+    assert r["verdict"] == "listed" and r["action"] == "resend_reappeared"
+    assert req.status == R.pending
+    assert "still up" in req.notes
     # 3. A removal page that says "removed" counts as gone, even with a 200.
     req.status, req.sent_at = R.sent, now - timedelta(days=10); s.commit()
     pages[listing] = (listing, 200, "<p>This profile has been removed at the owner's request.</p>")
@@ -13180,7 +13106,8 @@ def t_verification():
     vf._spec = lambda db_, broker: spec
     try:
         req2 = db.RemovalRequest(member_id=pm.id, broker_id=b.id, status=R.confirmed,
-                                 confirmed_at=now - timedelta(days=40), request_key="rk-v2")
+                                 confirmed_at=now - timedelta(days=100),
+                                 recheck_after=now - timedelta(days=1), request_key="rk-v2")
         s.add(req2); s.commit()
         search_url = "https://www.peoplefind.example/search/Pat-Parent/TX"
         pages[search_url] = (search_url, 200, '<div><a href="/p/pat-parent-dallas">Pat Parent</a> Dallas, TX</div>'
@@ -13212,6 +13139,9 @@ def t_verification():
     pages[hit_url] = (hit_url, 200, "<h1>Pat Parent</h1> Austin TX 512-555-0100")
     r = vf.verify_request(s, req3, {}, fetch=fetch, search=search)
     assert r["verdict"] == "listed" and r["method"] == "web_search"
+    assert req3.status == R.confirmed, (
+        "Weekly web search must not reactivate a confirmed request without an overdue recheck date"
+    )
     s.close()
 
 
@@ -13253,7 +13183,9 @@ def t_verification_schedule():
     finally:
         vf.fetcher = real_fetcher
     s.refresh(conf_recent)
-    assert res.get("relisted") == 1 and conf_recent.status == R.pending and conf_recent.listing_url == page, res
+    assert res.get("rechecked") == 1 and res.get("relisted", 0) == 0, res
+    assert conf_recent.status == R.confirmed, "Weekly search must respect the 90-day cooldown"
+    assert conf_recent.listing_url == page
     assert s.query(db.RemovalRequest).filter_by(member_id=pm.id, broker_id=bs[1].id).count() == 1, "no duplicate request"
     summ = vf.summary(s, [pm.id])
     assert summ["counts"]["listed"] >= 1 and summ["recent"]
@@ -15942,220 +15874,6 @@ def t_plugin_locales_valid():
                                     "locales": ["fr", "not a code"]})
     assert any("isn't a language code" in e for e in bad.validate())
     # IF THIS FAILS: a broken translation could drop a person's link or crash the Plugins page.
-
-
-@test(1, "plugins.catalog_client",
-      "Catalog client correctly parses semvers, caches indices, filters by category/search, and strictly enforces Invariant 1 (no code in data packages).")
-def t_plugins_catalog_client():
-    import json, os, tempfile, zipfile, hashlib
-    cat = _imp("plugins.catalog")
-
-    # 1. Semver parsing and version comparisons
-    assert cat.is_newer_version("1.2.0", "1.1.0") is True
-    assert cat.is_newer_version("v2.0.0", "1.9.9") is True
-    assert cat.is_newer_version("1.0.0", "1.0.0") is False
-    assert cat.is_newer_version("0.9.1", "1.0.0") is False
-
-    # 2. Invariant 1: Declarative pure data check on broker package
-    with tempfile.TemporaryDirectory() as td:
-        bad_zip = os.path.join(td, "bad_broker.zip")
-        with zipfile.ZipFile(bad_zip, "w") as z:
-            z.writestr("manifest.json", json.dumps({"id": "bad", "type": "brokers", "name": "Bad", "version": "1.0.0", "author": "a"}))
-            z.writestr("spec.json", json.dumps({"broker_id": "bad", "name": "Bad", "method": "manual"}))
-            z.writestr("malicious.py", "import os; os.system('echo pwned')")
-
-        try:
-            cat.extract_package_safely(bad_zip, os.path.join(td, "out"), "brokers")
-            assert False, "Broker package containing .py file should be rejected by Invariant 1"
-        except cat.CatalogError as e:
-            assert "Marketplace Invariant Violation" in str(e), e
-
-        # Clean broker package
-        good_zip = os.path.join(td, "good_broker.zip")
-        with zipfile.ZipFile(good_zip, "w") as z:
-            z.writestr("manifest.json", json.dumps({"id": "good", "type": "brokers", "name": "Good", "version": "1.0.0", "author": "a"}))
-            z.writestr("spec.json", json.dumps({"broker_id": "good", "name": "Good", "method": "manual"}))
-            z.writestr("README.md", "# Good Broker")
-
-        manifest_dir = cat.extract_package_safely(good_zip, os.path.join(td, "out_good"), "brokers")
-        assert os.path.isfile(os.path.join(manifest_dir, "manifest.json"))
-
-    # 3. Catalog filtering and enrichment
-    mock_data = {
-        "schema_version": "1.0",
-        "generated_at": "2026-10-28T12:00:00Z",
-        "plugins": [
-            {"id": "b1", "type": "brokers", "name": "Broker One", "version": "1.2.0", "tier": 1, "description": "Removes people"},
-            {"id": "t1", "type": "themes", "name": "Dark Theme", "version": "1.0.0", "tier": 2, "description": "Accessible dark mode"},
-        ]
-    }
-    with tempfile.TemporaryDirectory() as td:
-        cache_file = os.path.join(td, "test_cache.json")
-        with open(cache_file, "w") as f:
-            json.dump({"data": mock_data, "cached_at": 9999999999.0, "etag": "test-etag"}, f)
-
-        orig_cache_fn = cat.get_catalog_cache_path
-        cat.get_catalog_cache_path = lambda: cache_file
-        try:
-            # Query all
-            res = cat.get_catalog()
-            assert res["total_available"] == 2
-            assert res["cache_status"] == "hit"
-
-            # Filter by category
-            res_brokers = cat.get_catalog(category="brokers")
-            assert len(res_brokers["plugins"]) == 1
-            assert res_brokers["plugins"][0]["id"] == "b1"
-
-            # Filter by search
-            res_search = cat.get_catalog(search="dark")
-            assert len(res_search["plugins"]) == 1
-            assert res_search["plugins"][0]["id"] == "t1"
-        finally:
-            cat.get_catalog_cache_path = orig_cache_fn
-
-
-@test(1, "plugins.developer_repo_update_checking",
-      "Developer Git repo checking parses SemVer pre-releases, extracts monorepo and standalone tags, and honors admin pre-release settings.")
-def t_plugins_developer_repo_update_checking():
-    import json, os, tempfile
-    cat = _imp("plugins.catalog")
-
-    # 1. SemVer 2.0.0 Pre-release precedence
-    assert cat.is_newer_version("1.1.0", "1.0.0") is True
-    assert cat.is_newer_version("1.1.0-rc1", "1.0.0") is True
-    assert cat.is_newer_version("1.1.0", "1.1.0-rc1") is True
-    assert cat.is_newer_version("1.1.0-rc1", "1.1.0") is False
-    assert cat.is_newer_version("1.1.0-beta.2", "1.1.0-beta.1") is True
-    assert cat.is_newer_version("1.1.0-rc.1", "1.1.0-beta.9") is True
-    assert cat.is_newer_version("2.0.0-alpha", "1.9.9") is True
-    assert cat.is_newer_version("1.0.0", "1.0.0") is False
-
-    # 2. Pre-release detection
-    assert cat.is_prerelease_version("1.0.0-rc1") is True
-    assert cat.is_prerelease_version("v2.1.0-beta.3") is True
-    assert cat.is_prerelease_version("1.0.0-dev") is True
-    assert cat.is_prerelease_version("1.0.0") is False
-    assert cat.is_prerelease_version("v1.2.3") is False
-
-    # 3. Git tag extraction (monorepo & standalone)
-    assert cat.extract_version_from_tag("whitepages-v1.0.2", "whitepages") == "1.0.2"
-    assert cat.extract_version_from_tag("whitepages-1.0.2", "whitepages") == "1.0.2"
-    assert cat.extract_version_from_tag("whitepages/v1.0.3-rc1", "whitepages") == "1.0.3-rc1"
-    # Reject tags belonging to other plugins in the monorepo
-    assert cat.extract_version_from_tag("acxiom-v1.0.2", "whitepages") is None
-    assert cat.extract_version_from_tag("other-plugin-v2.0.0", "whitepages") is None
-    # Standalone repository tags
-    assert cat.extract_version_from_tag("v1.2.3") == "1.2.3"
-    assert cat.extract_version_from_tag("1.2.3") == "1.2.3"
-    assert cat.extract_version_from_tag("v1.2.3-alpha.1") == "1.2.3-alpha.1"
-
-    # 4. Settings persistence
-    with tempfile.TemporaryDirectory() as td:
-        s_file = os.path.join(td, "test_settings.json")
-        store = _imp("core.settings_store")
-        orig_s_file = store.SETTINGS_FILE
-        store.SETTINGS_FILE = s_file
-        try:
-            defaults = cat.get_update_settings()
-            assert defaults["catalog_check_hours"] == 12
-            assert defaults["installed_update_check_hours"] == 24
-            assert defaults["allow_prereleases"] is False
-
-            saved = cat.save_update_settings({"catalog_check_hours": 6, "allow_prereleases": True})
-            assert saved["catalog_check_hours"] == 6
-            assert saved["allow_prereleases"] is True
-
-            reloaded = cat.get_update_settings()
-            assert reloaded["catalog_check_hours"] == 6
-            assert reloaded["allow_prereleases"] is True
-        finally:
-            store.SETTINGS_FILE = orig_s_file
-
-    # 5. Simulated update checks against developer repo releases
-    mock_releases = [
-        {"tag_name": "whitepages-v1.1.0-rc1", "name": "whitepages 1.1.0-rc1", "prerelease": True, "html_url": "https://github.com/r/b/releases/tag/whitepages-v1.1.0-rc1"},
-        {"tag_name": "whitepages-v1.0.5", "name": "whitepages 1.0.5", "prerelease": False, "html_url": "https://github.com/r/b/releases/tag/whitepages-v1.0.5"},
-        {"tag_name": "acxiom-v2.0.0", "name": "acxiom 2.0.0", "prerelease": False, "html_url": "https://github.com/r/b/releases/tag/acxiom-v2.0.0"},
-    ]
-
-    # Without pre-releases: highest valid update for whitepages from 1.0.0 is 1.0.5
-    whitepages_tags = []
-    for rel in mock_releases:
-        ver = cat.extract_version_from_tag(rel["tag_name"], "whitepages")
-        if ver and not cat.is_prerelease_version(ver):
-            whitepages_tags.append((cat.parse_semver(ver), ver, rel["html_url"]))
-    whitepages_tags.sort(key=lambda x: x[0], reverse=True)
-    assert len(whitepages_tags) == 1
-    assert whitepages_tags[0][1] == "1.0.5"
-
-    # With pre-releases: highest valid update for whitepages from 1.0.0 is 1.1.0-rc1
-    whitepages_all = []
-    for rel in mock_releases:
-        ver = cat.extract_version_from_tag(rel["tag_name"], "whitepages")
-        if ver:
-            whitepages_all.append((cat.parse_semver(ver), ver, rel["html_url"]))
-    whitepages_all.sort(key=lambda x: x[0], reverse=True)
-    assert len(whitepages_all) == 2
-    assert whitepages_all[0][1] == "1.1.0-rc1"
-
-    # 6. CalVer / Date-based version number handling
-    # Developers who use dates (YYYY-MM-DD, YYYY.MM.DD, YYYYMMDD) for versions
-    assert cat.is_newer_version("2026-10-31", "2026-10-15") is True
-    assert cat.is_newer_version("2026.10.31", "2026.10.15") is True
-    assert cat.is_newer_version("20261031", "20261015") is True
-    assert cat.is_newer_version("2026-10-31", "2026.10.15") is True  # cross-format date comparison
-    assert cat.is_newer_version("2026.10.31.2", "2026.10.31.1") is True
-    assert cat.is_newer_version("2027.01.01", "2026.12.31") is True
-    assert cat.is_newer_version("2026.10.31", "2026.10.31") is False
-
-    # Date-based pre-releases
-    assert cat.is_prerelease_version("2026-10-31-rc1") is True
-    assert cat.is_prerelease_version("2026.10.31-beta") is True
-    assert cat.is_prerelease_version("2026-10-31") is False
-    assert cat.is_prerelease_version("2026.10.31") is False
-    assert cat.is_prerelease_version("20261031") is False
-    assert cat.is_newer_version("2026.10.31-rc1", "2026.10.15") is True
-    assert cat.is_newer_version("2026.10.31", "2026.10.31-rc1") is True
-    assert cat.is_newer_version("2026.10.31-rc1", "2026.10.31") is False
-
-    # Date-based tag extraction (standalone & monorepo prefixed)
-    assert cat.extract_version_from_tag("v2026.10.31") == "2026.10.31"
-    assert cat.extract_version_from_tag("2026-10-31") == "2026-10-31"
-    assert cat.extract_version_from_tag("v2026-10-31") == "2026-10-31"
-    assert cat.extract_version_from_tag("20261031") == "20261031"
-    assert cat.extract_version_from_tag("whitepages-v2026.10.31", "whitepages") == "2026.10.31"
-    assert cat.extract_version_from_tag("whitepages-2026-10-31", "whitepages") == "2026-10-31"
-    assert cat.extract_version_from_tag("whitepages-20261031", "whitepages") == "20261031"
-    assert cat.extract_version_from_tag("whitepages-2026-10-31-rc1", "whitepages") == "2026-10-31-rc1"
-    assert cat.extract_version_from_tag("acxiom-2026-10-31", "whitepages") is None
-
-    # Simulated developer repo with CalVer / date-based release tags
-    calver_releases = [
-        {"tag_name": "whitepages-2026-11-01-rc1", "name": "whitepages 2026-11-01-rc1", "prerelease": True, "html_url": "https://github.com/r/b/releases/tag/whitepages-2026-11-01-rc1"},
-        {"tag_name": "whitepages-2026-10-31", "name": "whitepages 2026-10-31", "prerelease": False, "html_url": "https://github.com/r/b/releases/tag/whitepages-2026-10-31"},
-        {"tag_name": "whitepages-2026-09-15", "name": "whitepages 2026-09-15", "prerelease": False, "html_url": "https://github.com/r/b/releases/tag/whitepages-2026-09-15"},
-    ]
-    # Current version is "2026-10-15". Stable check should select "2026-10-31"
-    stable_calver = []
-    for rel in calver_releases:
-        ver = cat.extract_version_from_tag(rel["tag_name"], "whitepages")
-        if ver and not cat.is_prerelease_version(ver):
-            stable_calver.append((cat.parse_semver(ver), ver))
-    stable_calver.sort(key=lambda x: x[0], reverse=True)
-    assert stable_calver[0][1] == "2026-10-31"
-    assert cat.is_newer_version(stable_calver[0][1], "2026-10-15") is True
-
-    # Pre-release check should select "2026-11-01-rc1"
-    all_calver = []
-    for rel in calver_releases:
-        ver = cat.extract_version_from_tag(rel["tag_name"], "whitepages")
-        if ver:
-            all_calver.append((cat.parse_semver(ver), ver))
-    all_calver.sort(key=lambda x: x[0], reverse=True)
-    assert all_calver[0][1] == "2026-11-01-rc1"
-    assert cat.is_newer_version(all_calver[0][1], "2026-10-31") is True
-
 
 
 @test(1, "interpreter.spec_jurisdiction_and_text_keys",

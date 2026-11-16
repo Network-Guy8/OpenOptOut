@@ -390,17 +390,28 @@ def _act(req, verdict, detail, evidence, previous, cfg, spec, now) -> str:
     if verdict == "listed":
         if evidence and not req.listing_url:
             req.listing_url = evidence
-        window = getattr(spec, "statutory_response_days", 0) or 45
-        overdue = req.sent_at is not None and now - req.sent_at > timedelta(days=window)
-        if st == RequestStatus.confirmed or (st in (RequestStatus.sent, RequestStatus.submitted) and overdue):
-            came_back = st == RequestStatus.confirmed and previous == "gone"
+        # A sent/submitted request is never automatically resubmitted
+        # merely because its statutory response window has elapsed.
+        # Only a previously confirmed removal may start another cycle,
+        # and only after its explicit 90-day recheck date.
+        recheck_due = (
+            st == RequestStatus.confirmed
+            and req.recheck_after is not None
+            and now >= req.recheck_after
+        )
+        if recheck_due:
+            came_back = previous == "gone"
             req.status = RequestStatus.pending
             req.confirmed_at = None
             req.sent_at = None
             what = "came back" if came_back else "is still up"
-            req.notes = ((req.notes or "") + f"\nChecked {now:%Y-%m-%d}: the listing {what}"
-                         + (f" ({evidence})" if evidence else "") + ". Sending the opt-out again.").strip()
-            return "resend_reappeared" if came_back else "resend"
+            req.notes = (
+                (req.notes or "") +
+                f"\nChecked {now:%Y-%m-%d}: the listing {what}" +
+                (f" ({evidence})" if evidence else "") +
+                ". Starting a new removal cycle after the 90-day recheck."
+            ).strip()
+            return "resend_reappeared"
     return ""
 
 

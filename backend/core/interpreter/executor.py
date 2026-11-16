@@ -61,6 +61,7 @@ class ExecResult:
     skipped: bool = False           # unclear matches left alone by setting
     not_listed: bool = False        # the search showed nobody who could be this person
     verified: bool = False          # the page showed the spec's success signal
+    human_confirmed_submission: bool = False  # person acknowledged final submission step
     email_rejected: bool = False    # the form refused the contact address (e.g. a "+" address)
     # Where a person took over in a form flow, so they can pick it up live
     # (core/live_captcha.py): the step index and "pause" (a pause_for_human
@@ -303,7 +304,51 @@ class PlaywrightExecutor(JobExecutor):
             elif a["op"] == "select":
                 await loc.select_option(a["value"], timeout=8000)
             elif a["op"] == "check":
-                await loc.check(timeout=8000, force=True)
+                try:
+                    try:
+                        await loc.check(timeout=8000)
+                    except Exception as check_error:
+                        if "outside of the viewport" not in str(check_error).lower():
+                            raise
+
+                        await loc.evaluate("""el => {
+                            if (el.disabled) {
+                                throw new Error("Checkbox is disabled");
+                            }
+                            el.checked = true;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""")
+
+                        if not await loc.is_checked():
+                            raise RuntimeError("Checkbox fallback failed")
+                except Exception as e:
+                    try:
+                        info = await loc.evaluate("""el => ({
+                            type: el.type,
+                            id: el.id,
+                            name: el.name,
+                            value: el.value,
+                            outerHTML: el.outerHTML.slice(0, 500),
+                            rect: (() => {
+                                const r = el.getBoundingClientRect();
+                                return {
+                                    x: r.x,
+                                    y: r.y,
+                                    width: r.width,
+                                    height: r.height
+                                };
+                            })()
+                        })""", timeout=3000)
+                    except Exception as inspect_error:
+                        info = f"inspection failed: {inspect_error}"
+
+                    error_summary = str(e).splitlines()[0]
+
+                    raise RuntimeError(
+                        f"Autofill checkbox failed: index={a['i']}, "
+                        f"info={info}, error={error_summary}"
+                    ) from None
         trace.append(f"[{i}] autofill: {', '.join(plan['mapped'])}")
 
     async def _turnstile_passed(self, wait_ms: int = 15000) -> bool:
@@ -388,6 +433,8 @@ class PlaywrightExecutor(JobExecutor):
         self._current_job = job
         self._current_frame = None
         self._verified = False
+        self._human_confirmed_submission = False
+        self._captcha_solved = {}
 
         # Extension point: a fill_form plugin may take over this broker entirely
         # (multi-form / complex wizard flow, roadmap item 3). Supports multi-stage
@@ -396,6 +443,7 @@ class PlaywrightExecutor(JobExecutor):
             try:
                 nav = next((st for st in job.steps if st.kind == "navigate"), None)
                 if nav and nav.url:
+                    self._captcha_solved.clear()
                     await self.page.goto(nav.url, timeout=20000)
                     await self.page.wait_for_timeout(1500)
 
@@ -458,6 +506,8 @@ class PlaywrightExecutor(JobExecutor):
                     if self.person_hook is not None and \
                             await self._maybe_await(self.person_hook({"kind": "pause", "text": s.text, "step": i})):
                         trace.append(f"[{i}] done by a person on the live page")
+                        if i == total - 1:
+                            self._human_confirmed_submission = True
                         continue
                     return ExecResult(ok=False, steps_run=i, steps_total=total,
                                       needs_manual=True, human_instruction=s.text,
@@ -513,6 +563,7 @@ class PlaywrightExecutor(JobExecutor):
                 return ExecResult(ok=False, steps_run=total, steps_total=total,
                                   detail=f"the broker's page didn't confirm the request ({e})", trace=trace)
         return ExecResult(ok=True, steps_run=total, steps_total=total, verified=verified,
+                          human_confirmed_submission=self._human_confirmed_submission,
                           detail="form flow complete", trace=trace, extra_picks=extra_picks)
 
     async def _email_rejected(self, job) -> bool:
@@ -575,6 +626,7 @@ class PlaywrightExecutor(JobExecutor):
 
         if s.kind == "navigate":
             self._current_frame = None  # Navigation resets frame context
+            self._captcha_solved.clear()
             resp = await self.page.goto(s.url, timeout=s.timeout_ms or 20000)
             await self.page.wait_for_timeout(1500)   # let the page settle
             if resp and getattr(resp, "status", None) == 429:
@@ -647,8 +699,14 @@ class PlaywrightExecutor(JobExecutor):
             if s.selector:
                 await self._loc(s.selector).click(timeout=s.timeout_ms or 8000)
             else:
-                await self.page.evaluate(
-                    "() => { const f = document.querySelector('form'); if (f) f.submit(); }")
+                submitted = await self.page.evaluate("""() => {
+                    const form = document.querySelector('form');
+                    if (!form) return false;
+                    form.requestSubmit();
+                    return true;
+                }""")
+                if not submitted:
+                    raise RuntimeError("No form found to submit")
             await self.page.wait_for_timeout(2000)
 
         elif s.kind == "expect_success":
@@ -664,7 +722,7 @@ class PlaywrightExecutor(JobExecutor):
         # widget appeared, try to solve it (via the solver hook) or pause for
         # the human path.
         try:
-            if s.kind not in ("wait", "expect_success"):
+            if s.kind not in ("wait", "expect_success", "solve_captcha"):
                 for sel in CAPTCHA_SELECTORS:
                     el = await self.page.query_selector(sel)
                     if el and await el.is_visible():
@@ -830,12 +888,28 @@ class PlaywrightExecutor(JobExecutor):
         try:
             content = await self.page.content()
             low = content.lower()
-            if "hcaptcha" in low:
-                ctype = "hcaptcha"
-            elif "recaptcha" in low:
+            m = re.search(
+                r"""(?:var|let|const)\s+sitekey\s*=\s*['"]([^'"]+)['"]""",
+                content,
+                re.I,
+            )
+            if m:
+               site_key = m.group(1)
+
+            if site_key.startswith("0x") and re.search(
+                r"challenges\.cloudflare\.com|cf-turnstile", low
+            ):
+                ctype = "turnstile"
+            elif site_key and re.search(
+                r"recaptcha(?:/api\.js|\.render|/api2/)", low
+            ):
                 ctype = "recaptcha_v2"
             elif re.search(r"challenges\.cloudflare\.com|cf-turnstile", low):
                 ctype = "turnstile"
+            elif "hcaptcha" in low:
+                ctype = "hcaptcha"
+            elif "recaptcha" in low:
+                ctype = "recaptcha_v2"
             elif re.search(r"<img[^>]+captcha", low):
                 ctype = "image"
             # Try to read a site-key attribute from a common widget or iframe URL.
@@ -843,13 +917,38 @@ class PlaywrightExecutor(JobExecutor):
                 el = await self.page.query_selector("[data-sitekey]")
                 if el:
                     site_key = await el.get_attribute("data-sitekey") or ""
-                if not site_key and ctype == "turnstile":
-                    iframe_el = await self.page.query_selector("iframe[src*='challenges.cloudflare.com']")
-                    if iframe_el:
-                        src = await iframe_el.get_attribute("src") or ""
-                        m = re.search(r"[?&]sitekey=([a-zA-Z0-9_\.-]+)", src)
+                if not site_key and ctype == "recaptcha_v2":
+                    for frame in self.page.frames:
+                        frame_url = frame.url or ""
+                        if "recaptcha" not in frame_url.lower():
+                            continue
+                        m = re.search(r"[?&]k=([a-zA-Z0-9_-]+)", frame_url)
                         if m:
                             site_key = m.group(1)
+                            break
+
+                    if not site_key:
+                        iframe_el = await self.page.query_selector(
+                            "iframe[src*='recaptcha']"
+                        )
+                        if iframe_el:
+                            src = await iframe_el.get_attribute("src") or ""
+                            m = re.search(r"[?&]k=([a-zA-Z0-9_-]+)", src)
+                            if m:
+                                site_key = m.group(1)
+                if not site_key and ctype == "turnstile":
+                    for frame in self.page.frames:
+                        frame_url = frame.url or ""
+                        if "challenges.cloudflare.com" not in frame_url.lower():
+                            continue
+
+                        m = re.search(
+                            r"/(0x[a-zA-Z0-9_-]+)/",
+                            frame_url,
+                        )
+                        if m:
+                            site_key = m.group(1)
+                            break
             except Exception:
                 pass
         except Exception:
@@ -885,6 +984,15 @@ class PlaywrightExecutor(JobExecutor):
         """
         challenge = await self._detect_challenge(selector)
         self.last_challenge = challenge
+        challenge_id = (
+            self.page.url,
+            challenge.get("type"),
+            challenge.get("site_key"),
+        )
+
+        if challenge_id in self._captcha_solved:
+            trace.append(f"[{i}] CAPTCHA already solved on this page — skipping duplicate")
+            return False
         if not self.captcha_solver:
             trace.append(f"[{i}] CAPTCHA detected — no solver installed, pausing for human")
             return True
@@ -893,13 +1001,26 @@ class PlaywrightExecutor(JobExecutor):
         except Exception as e:
             trace.append(f"[{i}] CAPTCHA solver errored ({e}) — pausing for human")
             return True
-        if not result or result.get("defer_to_human") or not result.get("solved"):
-            trace.append(f"[{i}] CAPTCHA solver deferred — pausing for human")
+        if result and result.get("error"):
+            trace.append(
+                f"[{i}] CAPTCHA solver "
+                f"({result.get('plugin_id', 'unknown')}) failed: "
+                f"{str(result['error'])[:200]} — pausing for human"
+            )
             return True
+
+        if not result or result.get("defer_to_human") or not result.get("solved"):
+            plugin_id = result.get("plugin_id", "none") if result else "none"
+            trace.append(
+                f"[{i}] CAPTCHA solver ({plugin_id}) deferred — pausing for human"
+            )
+            return True
+
         if result.get("by_person"):
             # A person solved it in this very page (core/live_captcha.py).
             trace.append(f"[{i}] CAPTCHA solved by a person — continuing")
             return False
+
         text = result.get("text") or (result.get("token") if challenge.get("type") == "image" else "")
         if text and challenge.get("meta", {}).get("answer_selector"):
             try:
@@ -937,7 +1058,8 @@ class PlaywrightExecutor(JobExecutor):
                         cf.dispatchEvent(new Event('change', { bubbles: true }));
                     }
                 }""", token)
-            trace.append(f"[{i}] CAPTCHA solved by plugin — token injected, continuing")
+            self._captcha_solved[challenge_id] = token
+            trace.append(f"[{i}] CAPTCHA token injected — continuing")
             return False
         except Exception as e:
             trace.append(f"[{i}] token injection failed ({e}) — pausing for human")

@@ -125,6 +125,7 @@ def hits(member_id: int, status: Optional[str] = Query(None),
     out = [{"id": h.id, "url": h.url, "domain": h.domain, "title": h.title, "snippet": h.snippet,
             "strength": h.strength, "matched_on": h.matched_on, "query_label": h.query_label,
             "broker_name": brokers.get(h.broker_id), "status": h.status,
+            "dismiss_reason": h.dismiss_reason,
             "found_at": h.found_at.isoformat() if h.found_at else None} for h in rows]
     out.sort(key=lambda h: (h["status"] != "new", order.get(h["strength"], 3)))
     return {"hits": out, "run": _RUNS.get(member_id) or {"running": False}}
@@ -156,4 +157,17 @@ class DismissIn(LimitedModel):
 @router.post("/hits/{hit_id}/dismiss")
 def dismiss(hit_id: int, body: DismissIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     wsm.dismiss_hit(db, _hit(db, user, hit_id), body.reason)
+    return {"ok": True}
+
+
+# KEEP_LISTING_V1
+@router.post("/hits/{hit_id}/restore")
+def restore_hit(hit_id: int, db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    h = _hit(db, user, hit_id)
+    if h.status != "dismissed" or h.dismiss_reason != "keep_listing":
+        raise HTTPException(409, "This listing is not marked Keep Listing.")
+    h.status = "new"
+    h.dismiss_reason = None
+    db.commit()
     return {"ok": True}

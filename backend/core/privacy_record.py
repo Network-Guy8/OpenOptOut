@@ -26,6 +26,9 @@ DEFAULT_RETENTION_DAYS = 365
 # encrypted: "field" = encrypted column (FIELD_ENCRYPTION_KEY); "db" = only as
 # protected as the database itself (SQLCipher / provider encryption).
 INVENTORY = [
+    {"key": "breach_monitoring", "what": "Selected email identities and known breach findings",
+     "tables": ["breach_monitors"], "why": "Opt-in email breach monitoring through HIBP",
+     "encrypted": "field", "kept": "Artifact retention; shorter minors retention; cleared on opt-out or deletion"},
     {"key": "names", "what": "Names (main name, other spellings, legal name)",
      "tables": ["family_members.full_name", "identities (kind=name)", "family_members.formal_name"],
      "why": "To find listings and ask sites to remove them", "encrypted": "field (other spellings, legal name); db (main name)",
@@ -339,6 +342,7 @@ def export_person(db, member) -> dict:
     from ..models import database as m
     from .age import member_dob
     from .timeline import build
+    from .breach_monitor import unpack
     reqs = db.query(m.RemovalRequest).filter(m.RemovalRequest.member_id == member.id).all()
     dob = member_dob(member)
     return {
@@ -361,6 +365,8 @@ def export_person(db, member) -> dict:
         } for r in reqs],
         "search_results": [{"url": h.url, "title": h.title, "found": _iso(getattr(h, "found_at", None))}
                            for h in db.query(m.WebSearchHit).filter(m.WebSearchHit.member_id == member.id)],
+        "breach_monitoring": unpack(
+            db.get(m.BreachMonitor, member.id)),
         "account": _account(member.user),
         "never_stored": NEVER_STORED,
     }
@@ -470,6 +476,8 @@ def purge(db, cfg: dict, now: Optional[datetime] = None, screenshots_dir: Option
                 coppa_purged += db.query(m.ConfirmationLink).filter(m.ConfirmationLink.request_id.in_(old_child_reqs)).delete(synchronize_session=False)
                 coppa_purged += db.query(m.EmailLog).filter(m.EmailLog.request_id.in_(old_child_reqs), m.EmailLog.body_snippet.isnot(None))\
                     .update({m.EmailLog.body_snippet: None}, synchronize_session=False)
+    from .breach_monitor import purge as purge_breach_findings
+    purge_breach_findings(db, cfg, now)
     st["coppa_records"] = coppa_purged
 
     # Opt-out address labels written before they were masked held names and

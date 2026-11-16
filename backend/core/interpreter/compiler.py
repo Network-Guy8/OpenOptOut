@@ -268,11 +268,46 @@ def compile_job(spec: BrokerSpec, member_fields: dict, member_id: str, lang: str
         if missing:
             raise CompileError(
                 f"member is missing fields required by '{spec.broker_id}' email: {missing}")
+        if e.subject_template and e.body_template:
+            subject = _render(e.subject_template, member_fields)
+            body = _render(e.body_template, member_fields)
+            locale = e.locale
+        else:
+            from ..legal_letters import compose_letter
+            from ..optout_email_template import Identifiers
+
+            name = str(member_fields.get("full_name") or "").strip()
+            if not name:
+                raise CompileError("email request requires full_name")
+
+            ids = Identifiers(
+                full_name=name,
+                emails=[str(member_fields["email"])] if member_fields.get("email") else [],
+                phones=[str(member_fields["phone"])] if member_fields.get("phone") else [],
+                addresses=[str(member_fields["address"])] if member_fields.get("address") else [],
+            )
+            letter = compose_letter(
+                ids,
+                spec.name,
+                jurisdiction=spec.effective_jurisdiction(),
+                legal_language=spec.effective_legal_language(),
+                residence_state=str(member_fields.get("state") or ""),
+                request_key=str(member_fields.get("request_key") or ""),
+            )
+            subject, body, locale = letter.subject, letter.body, letter.language
+
+        listing_url = str(member_fields.get("listing_url") or "").strip()
+        if listing_url:
+            body += f"\n\nSpecific listing requested for removal:\n{listing_url}"
+
+        if not subject.strip() or not body.strip():
+            raise CompileError("email subject or body is empty")
+
         job.email = EmailJob(
             to_address=e.to_address,
-            subject=_render(e.subject_template, member_fields),
-            body=_render(e.body_template, member_fields),
-            locale=e.locale,
+            subject=subject,
+            body=body,
+            locale=locale,
         )
         return job
 

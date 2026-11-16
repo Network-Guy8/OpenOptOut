@@ -1,0 +1,25 @@
+{
+  "id": "cpa",
+  "title": "Colorado \u2014 Colorado Privacy Act",
+  "law": "Colorado Privacy Act (C.R.S. \u00a7 6-1-1301 et seq.)",
+  "legal_basis": [
+    "cpa"
+  ],
+  "jurisdictions": [
+    "US"
+  ],
+  "residents_of": [
+    "CO"
+  ],
+  "deadline_days": 45,
+  "default_language": "en",
+  "review_status": "draft",
+  "review_note": "Not reviewed by a lawyer. Confirm CPA applicability, controller exemptions, authorized-agent requirements, deletion obligations, and response deadlines.",
+  "languages": {
+    "en": {
+      "subject": "Colorado Privacy Act deletion and opt-out request \u2014 {full_name}{ref_tag}",
+      "body": "To the Privacy / Data Protection team at {broker},\n\nI am a Colorado resident requesting deletion of my personal data and opting out of the sale of my personal data under the Colorado Privacy Act, where applicable.\n\n{scope}\n\n{property_note}\n\nPlease identify and delete records associated with the following identifiers, subject to applicable legal exceptions:\n\n{identifiers}\n\nI request that you:\n1. Delete personal data concerning me that is subject to my deletion rights under the CPA.\n2. Stop selling my personal data and processing it for targeted advertising where my opt-out rights apply.\n3. Apply this request across applicable affiliated properties and processors, as required by law.\n4. Confirm completion in writing, or explain any applicable exceptions or reasons for denial.\n\n{law}\n\nIf reasonable identity verification is required, please explain what information is necessary. Please avoid requesting unnecessary sensitive information.\n\n{reference}\n\nThank you.\n\nSincerely,\n{full_name}\n",
+      "law": "As a resident of {state}, I am exercising applicable rights under the Colorado Privacy Act (C.R.S. \u00a7 6-1-1301 et seq.), including C.R.S. \u00a7 6-1-1306. Please respond within the applicable statutory period, generally 45 days."
+    }
+  }
+}

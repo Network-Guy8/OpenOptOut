@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link2, ExternalLink, ChevronDown, ChevronRight, Search, CheckCircle2, AlertTriangle } from 'lucide-react'
 import api from '../api'
 import WebSearchResults from './WebSearchResults'
+import BreachMonitor from './BreachMonitor'
 import { tx, txr } from '../i18n/tx'
 import { detailText } from '../errorMessage'
 import { isSafeHref } from './Markdown'
@@ -140,6 +141,7 @@ export default function FindListings({ memberId, memberName, onAdded }) {
         </>
       )}
 
+      <BreachMonitor key={memberId} memberId={memberId} />
       <WebSearchResults memberId={memberId} memberName={memberName} onAdded={onAdded} />
     </section>
   )

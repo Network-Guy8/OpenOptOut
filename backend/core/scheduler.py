@@ -24,7 +24,6 @@ UUID_RE = re.compile(
 )
 
 _in_maintenance: bool = False
-_last_plugin_update_window_id: Optional[str] = None
 _maintenance_monitor_thread: Optional[threading.Thread] = None
 _maintenance_stop_event = threading.Event()
 
@@ -43,12 +42,11 @@ def check_maintenance_windows(now: Optional[datetime] = None) -> bool:
     Resumes the scheduler if exiting a maintenance window.
     Returns True if currently in a maintenance window, else False.
     """
-    global _in_maintenance, _last_plugin_update_window_id
+    global _in_maintenance
     in_win, win = is_downtime_active(now=now)
     s = get_scheduler()
 
     if in_win:
-        win_id = win.get("id") if win else None
         if not _in_maintenance:
             _in_maintenance = True
             desc = win.get("description", "Host server updates and backups") if win else "Downtime"
@@ -64,23 +62,6 @@ def check_maintenance_windows(now: Optional[datetime] = None) -> bool:
                 get_worker_registry().set_fleet_drain(True)
             except Exception as e:
                 log.debug("Worker registry drain broadcast skipped: %s", e)
-
-        # Apply pending plugin updates if configured for this window
-        if win and win.get("apply_plugin_updates") and win_id and _last_plugin_update_window_id != win_id:
-            _last_plugin_update_window_id = win_id
-            log.info("Applying pending plugin updates during maintenance window %s", win_id)
-            try:
-                from ..models.database import SessionLocal
-                from ..plugins.catalog import apply_pending_plugin_updates
-                db = SessionLocal()
-                try:
-                    res = apply_pending_plugin_updates(db)
-                    log.info("Maintenance window plugin updates applied: %d, failed: %d", len(res.get("applied", [])), len(res.get("failed", [])))
-                finally:
-                    db.close()
-            except Exception as e:
-                log.error("Error applying plugin updates in maintenance window %s: %s", win_id, e)
-
         return True
     else:
         if _in_maintenance:
@@ -136,6 +117,17 @@ def start_scheduler():
     if s.running: return
     cfg = load_settings()
     sc  = cfg.get("scheduler", {})
+    broker_health_hours = max(6, min(168, int(
+        sc.get("broker_health_interval_hours") or 24
+    )))
+    verification_hours = max(6, min(168, int(
+        sc.get("verification_interval_hours") or 24
+    )))
+
+    from .breach_monitor import scheduled_check as breach_check
+    s.add_job(breach_check, IntervalTrigger(hours=1), id="breach_monitor",
+              replace_existing=True, misfire_grace_time=3600, max_instances=1,
+              next_run_time=datetime.utcnow() + timedelta(minutes=8))
 
     # ── Maintenance jobs: run whether or not opt-outs are scheduled ──
     # Daily certificate check (LDAP, SIP2, SAML IdP): dashboard alerts + one
@@ -151,6 +143,30 @@ def start_scheduler():
 
     # Broker list upkeep: California DROP checklist items, dead-site checks,
     # and a monthly refresh of state registries that have a saved address.
+    s.add_job(
+        broker_website_check_job,
+        IntervalTrigger(hours=broker_health_hours),
+        id="broker_website_checks",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+        next_run_time=datetime.utcnow() + timedelta(minutes=12),
+    )
+
+    s.add_job(
+        rotating_broker_search_job,
+        IntervalTrigger(
+            hours=max(6, min(168, int(
+                sc.get("broker_search_interval_hours") or 12
+            )))
+        ),
+        id="rotating_broker_search",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+        next_run_time=datetime.utcnow() + timedelta(minutes=25),
+    )
+
     s.add_job(registry_maintenance_job, IntervalTrigger(hours=24), id="registry_maintenance",
               replace_existing=True, misfire_grace_time=3600,
               next_run_time=datetime.utcnow() + timedelta(minutes=10))
@@ -165,7 +181,7 @@ def start_scheduler():
               next_run_time=datetime.utcnow() + timedelta(minutes=5))
 
     # Removal checks: did listings go, and have any come back? Daily, on a budget.
-    s.add_job(verification_job, IntervalTrigger(hours=24), id="verification",
+    s.add_job(verification_job, IntervalTrigger(hours=verification_hours), id="verification",
               replace_existing=True, misfire_grace_time=3600,
               next_run_time=datetime.utcnow() + timedelta(minutes=20))
 
@@ -196,11 +212,6 @@ def start_scheduler():
     s.add_job(system_updater_job, IntervalTrigger(minutes=15), id="system_updater",
               replace_existing=True, misfire_grace_time=600,
               next_run_time=datetime.utcnow() + timedelta(minutes=3))
-
-    # Plugin & marketplace updates: periodic discovery check (12h default) + installed repo check (24h default)
-    s.add_job(plugin_updater_job, IntervalTrigger(hours=1), id="plugin_updater",
-              replace_existing=True, misfire_grace_time=1800,
-              next_run_time=datetime.utcnow() + timedelta(minutes=5))
 
     if not sc.get("enabled", False):
         s.start()
@@ -282,6 +293,42 @@ def start_scheduler():
     log.info(f"Scheduler started — spread_mode={spread_mode}, email poll every {poll_mins}m")
 
 
+def rotating_broker_search_job():
+    """Independent rotating SearXNG broker/member searches."""
+    from .rotating_broker_search import run
+
+    db = SessionLocal()
+    try:
+        result = run(db, load_settings())
+        log.info("Rotating broker search: %s", result)
+    except Exception:
+        db.rollback()
+        log.exception("Rotating broker search failed")
+    finally:
+        db.close()
+
+
+def broker_website_check_job():
+    """Probe broker homepages without changing registry maintenance cadence."""
+    from .network_health import is_internet_available
+    if not is_internet_available():
+        log.info("Broker website checks skipped: offline")
+        return
+
+    db = SessionLocal()
+    try:
+        from .broker_health import probe_sites
+        result = probe_sites(db, limit=50)
+        log.info(
+            "Broker website checks: %d checked, %d unreachable",
+            result["checked"], result["unreachable"]
+        )
+    except Exception as exc:
+        log.warning("Broker website checks failed: %s", exc)
+    finally:
+        db.close()
+
+
 def registry_maintenance_job():
     """Daily: DROP checklist items, up to 50 site checks; monthly: registry refresh."""
     from .network_health import is_internet_available
@@ -298,15 +345,10 @@ def registry_maintenance_job():
             ensure_drop_items(db)
         except Exception as e:
             log.warning("DROP checklist upkeep failed: %s", e)
-        try:
-            res = probe_sites(db, limit=50)
-            log.info("Site checks: %d checked, %d unreachable", res["checked"], res["unreachable"])
-        except Exception as e:
-            log.warning("Site checks failed: %s", e)
         # Look for privacy-request pages on brokers nobody wrote steps for.
         try:
             from .privacy_finder import run_daily as find_privacy_pages
-            pf = find_privacy_pages(db, limit=20)
+            pf = find_privacy_pages(db, limit=50)
             if pf["checked"]:
                 log.info("Privacy-page finder: %d sites checked, %d with a privacy page", pf["checked"], pf["found"])
         except Exception as e:
@@ -813,12 +855,148 @@ def _confirm_by_key(db, cfg: dict, key: str, subj: str, body: str, via_label: st
     return len(matching_reqs)
 
 
+
+# CALLAPP_ALIAS_MONITOR_V1
+
+# CALLAPP_CONFIRMATION_V1
+def _is_callapp_confirmation(from_header, subject, body):
+    """Recognize CallApp's unlisting acknowledgment."""
+    from email.utils import parseaddr
+
+    sender = parseaddr(from_header or "")[1].lower()
+    subject = (subject or "").strip().lower()
+    body = (body or "").lower()
+
+    return (
+        sender == "support@callapp.com"
+        and "conformation for unlist" in subject
+        and "per your request we have unlist your number" in body
+    )
+
+
+def _log_callapp_confirmation(db, mailbox, imap_uid):
+    """Persist an unmatched CallApp confirmation exactly once."""
+    from ..models.database import EmailLog
+
+    if imap_uid is None:
+        return False
+
+    label = (
+        f"[CallApp unlisting accepted | mailbox {mailbox.id} | "
+        f"UID {imap_uid}]"
+    )
+
+    existing = db.query(EmailLog).filter(
+        EmailLog.request_id.is_(None),
+        EmailLog.direction == "received",
+        EmailLog.subject == label,
+    ).first()
+
+    if existing:
+        return False
+
+    db.add(EmailLog(
+        request_id=None,
+        direction="received",
+        subject=label,
+        body_snippet=(
+            "CallApp acknowledged an unlisting request. "
+            "Processing may take up to seven days. "
+            "Individual family member not identified."
+        ),
+        matched_key=None,
+    ))
+    db.commit()
+    return True
+
+
+def _is_callapp_alias_message(to_header: str, from_header: str) -> bool:
+    """Identify CallApp mail to the shared manual opt-out alias."""
+    from email.utils import getaddresses, parseaddr
+
+    recipients = {
+        address.strip().lower()
+        for _, address in getaddresses([to_header or ""])
+    }
+    sender = parseaddr(from_header or "")[1].strip().lower()
+
+    return (
+        "callapp-optout@example.com" in recipients
+        and sender.endswith("@callapp.com")
+    )
+
+
 def _handle_member_message(db, cfg: dict, mailbox, to_h: str, from_h: str,
-                           subj: str, text: str, links=None) -> int:
+                           subj: str, text: str, links=None, imap_uid=None) -> int:
     """Match one message in a family member's inbox: +address tag first, then
     a tracking key in the subject/snippet. `links` is None when the inbox
     couldn't give us the message's links (older provider plugins)."""
     from . import mailboxes as mbx
+
+    if _is_callapp_confirmation(from_h, subj, text):
+        if _log_callapp_confirmation(db, mailbox, imap_uid):
+            log.info(
+                "CallApp unlisting acknowledgment saved: "
+                "mailbox=%s uid=%s",
+                mailbox.id, imap_uid,
+            )
+        return 0
+
+    if _is_callapp_alias_message(to_h, from_h):
+        # CALLAPP_ALIAS_PERSIST_V1
+        # An IMAP UID is stable within a mailbox's UIDVALIDITY epoch.
+        # No automatic request confirmation or member assignment.
+        if imap_uid is not None:
+            from ..models.database import EmailLog
+
+            uid = str(imap_uid)
+            label = (
+                f"[CallApp verification | mailbox {mailbox.id} | "
+                f"UID {uid}]"
+            )
+            existing = db.query(EmailLog).filter(
+                EmailLog.request_id.is_(None),
+                EmailLog.direction == "received",
+                EmailLog.subject == label,
+            ).first()
+
+            if existing is None:
+                db.add(EmailLog(
+                    request_id=None,
+                    direction="received",
+                    subject=label,
+                    body_snippet=(
+                        "CallApp unlisting verification received. "
+                        "Manual review required; family member not identified. "
+                        "No removal confirmation performed."
+                    ),
+                    matched_key=None,
+                ))
+                db.commit()
+                log.warning(
+                    "CALLAPP_ALIAS_PERSIST_V1: Saved CallApp message "
+                    "mailbox=%s uid=%s",
+                    mailbox.id, uid,
+                )
+        # Automatically respond only when the mailbox has
+        # exactly one eligible outstanding CallApp request.
+        # Multiple requests cannot be correlated safely.
+        from .callapp_verification import auto_verify
+
+        try:
+            outcome = auto_verify(db, cfg, mailbox)
+            log.info(
+                "CallApp verification processing: mailbox=%s status=%s",
+                mailbox.id, outcome,
+            )
+        except Exception:
+            db.rollback()
+            log.exception(
+                "CallApp verification processing failed: mailbox=%s",
+                mailbox.id,
+            )
+        return 0
+
     matched = 0
     hit = mbx.match_inbound(db, mailbox, to_h, from_h)
     keys = set(hit["request_keys"])
@@ -891,6 +1069,7 @@ def _poll_member_mailboxes(db, cfg: dict) -> tuple:
 
 
 def _poll_member_imap(db, cfg: dict, mb) -> int:
+    from .oauth_engine import _decrypt
     from .memory_hygiene import ephemeral_secret
     from . import mailboxes as mbx
     if not mb.imap_host or not mb.password_enc:
@@ -898,20 +1077,26 @@ def _poll_member_imap(db, cfg: dict, mb) -> int:
     matched = 0
     conn = imaplib.IMAP4_SSL(mb.imap_host, mb.imap_port or 993)
     try:
-        with ephemeral_secret(mb.password_enc) as pw:
+        with ephemeral_secret(_decrypt(mb.password_enc), decrypt=False) as pw:
+            if not pw:
+                raise ValueError("Unable to decrypt mailbox IMAP password")
             conn.login(mb.username or mbx.base_address(mb.address), pw)
         conn.select("INBOX")
-        _, msg_ids = conn.search(None, "UNSEEN")
+        # Limit IMAP polling to recent unread messages.
+        # IMAP SINCE uses the message's internal delivery date.
+        since_date = (datetime.utcnow() - timedelta(days=14)).strftime("%d-%b-%Y")
+        _, msg_ids = conn.uid("search", None, "SINCE", since_date)
         for mid in msg_ids[0].split():
             # BODY.PEEK leaves the message unread for the person.
-            _, data = conn.fetch(mid, "(BODY.PEEK[])")
+            _, data = conn.uid("fetch", mid, "(BODY.PEEK[])")
             msg = email.message_from_bytes(data[0][1])
             to_h = ", ".join(filter(None, [msg.get("To", ""), msg.get("Delivered-To", "")]))
             from .confirm_links import extract_links
             body = _get_body(msg)
             matched += _handle_member_message(db, cfg, mb, to_h, msg.get("From", ""),
                                               msg.get("Subject", ""), body[:2000],
-                                              links=extract_links(body, _get_html(msg)))
+                                              links=extract_links(body, _get_html(msg)),
+                                              imap_uid=mid.decode("ascii"))
     finally:
         try:
             conn.logout()
@@ -1075,15 +1260,6 @@ def system_updater_job():
         log.warning("System updater job error: %s", e)
 
 
-def plugin_updater_job():
-    """Periodic job (hourly): check marketplace discovery (12h) and developer repo updates (24h)."""
-    try:
-        from ..plugins.catalog import run_periodic_plugin_checks
-        run_periodic_plugin_checks()
-    except Exception as e:
-        log.warning("Plugin updater job error: %s", e)
-
-
 def spec_helper_job():
     """Hourly: work on queued step repairs and, if turned on, draft new steps."""
     db = SessionLocal()
@@ -1202,18 +1378,20 @@ def recheck_job():
         from .verification import verify_request, settings_of as vsettings
         verify_on = vsettings(cfg)["enabled"]
         for req in overdue:
-            # Look first: a listing that's still gone doesn't need another opt-out.
-            if verify_on:
-                try:
-                    res = verify_request(db, req, cfg)
-                    if res["verdict"] in ("gone", "not_found") or res["action"].startswith("resend"):
-                        queued += 1 if res["action"].startswith("resend") else 0
-                        continue
-                except Exception as ve:
-                    log.info("check before re-send failed for request %s: %s", req.id, ve)
-            req.status = RequestStatus.pending
-            req.confirmed_at = None; req.sent_at = None
-            queued += 1
+            # No verification means no automatic re-submission.
+            if not verify_on:
+                continue
+            try:
+                res = verify_request(db, req, cfg)
+                if res.get("action", "").startswith("resend"):
+                    queued += 1
+            except Exception as ve:
+                # CAPTCHA, network failures and unknown results are not
+                # evidence that a listing has returned.
+                log.info(
+                    "Recheck inconclusive for request %s; leaving confirmed: %s",
+                    req.id, ve
+                )
         db.commit()
         run.rechecks_queued = queued; run.status = "done"
         log.info(f"Recheck: {queued} re-queued")

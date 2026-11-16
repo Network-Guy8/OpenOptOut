@@ -125,11 +125,19 @@ class EmailConfigOut(BaseModel):
 
 
 class SchedulerConfig(LimitedModel):
+    broker_search_enabled: Optional[bool] = False
+    broker_search_interval_hours: Optional[int] = Field(12, ge=6, le=168)
+    broker_search_daily_limit: Optional[int] = Field(100, ge=1, le=1000)
+    broker_search_run_limit: Optional[int] = Field(50, ge=1, le=500)
+    broker_search_recheck_days: Optional[int] = Field(30, ge=1, le=365)
+
     enabled:               Optional[bool] = False
     run_time:              Optional[str]  = "02:00"
     timezone:              Optional[str]  = "America/Chicago"
     max_optouts_per_day:   Optional[int]  = 20
     recheck_interval_days: Optional[int]  = 90
+    broker_health_interval_hours: Optional[int] = Field(24, ge=6, le=168)
+    verification_interval_hours: Optional[int] = Field(24, ge=6, le=168)
     auto_recheck:          Optional[bool] = True
     pause_before_send:     Optional[bool] = True
     # Order in which throttled brokers are dispatched each day:
