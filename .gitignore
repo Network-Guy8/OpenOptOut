@@ -88,3 +88,25 @@ scratch/
 # Private security audit findings — kept local, never committed
 # (lists open vulnerabilities before fixes ship; share via a private channel)
 docs/dev/audit-findings.md
+
+# Local recovery backups — never commit
+*.bak
+*.bak-*
+*.backup
+*.backup-*
+*.original
+*.before-*
+*.retry-backup
+*~
+
+# Local backup directories
+backup-*/
+
+# Timestamped backup files
+*.bak.*
+
+# SearXNG configuration snapshots
+deploy/searxng/*.pre-*
+
+# Local experimental Docker overrides
+compose.plugin-sandbox.yaml
