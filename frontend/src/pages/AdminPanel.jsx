@@ -8,6 +8,7 @@ import api from '../api'
 import { tx, txn, txr } from '../i18n/tx'
 import { detailText } from '../errorMessage'
 import Modal from '../components/Modal'
+import PasswordPrompt from '../components/PasswordPrompt'
 import Field, { inputCls as input } from '../components/Field'
 
 const ROLE_STYLES = {
@@ -203,7 +204,7 @@ function UserSelect({ users, value, onChange, placeholder }) {
 }
 
 // ── Edit user inline ──────────────────────────────────────────────────────────
-function EditUserRow({ user, onUpdated, onDeleted, currentUserId, isSuper, onEditPermissions }) {
+function EditUserRow({ user, onUpdated, onDeleted, currentUserId, isSuper, onEditPermissions, onSetPassword }) {
   const [editing, setEditing] = useState(false)
   const [role, setRole]       = useState(user.role)
   const [saving, setSaving]   = useState(false)
@@ -227,12 +228,7 @@ function EditUserRow({ user, onUpdated, onDeleted, currentUserId, isSuper, onEdi
     onDeleted(user.id)
   }
 
-  const setPassword = async () => {
-    const pw = prompt(tx("Set new password for {full_name}:", { full_name: user.full_name }))
-    if (!pw) return
-    await api.patch(`/admin/users/${user.id}`, { password: pw })
-    alert(tx("Password updated."))
-  }
+  const setPassword = () => onSetPassword(user)
 
   const signOutEverywhere = async () => {
     if (!confirm(tx("Sign {full_name} out of every device?", { full_name: user.full_name }))) return
@@ -301,6 +297,7 @@ export default function AdminPanel() {
   const [grants, setGrants]   = useState([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
+  const [passwordUser, setPasswordUser] = useState(null)
   const [showGrant, setShowGrant]   = useState(false)
   const [me, setMe] = useState(null)
   const [perms, setPerms] = useState(null)          // { catalog, defaults, builtin_defaults }
@@ -389,6 +386,7 @@ export default function AdminPanel() {
                   currentUserId={me?.id}
                   isSuper={isSuper}
                   onEditPermissions={setPermTarget}
+                  onSetPassword={setPasswordUser}
                   onUpdated={updated => setUsers(us => us.map(x => x.id === updated.id ? updated : x))}
                   onDeleted={id => setUsers(us => us.filter(x => x.id !== id))}
                 />
@@ -457,6 +455,22 @@ export default function AdminPanel() {
           )}
         </div>
       )}
+
+      <PasswordPrompt
+        isOpen={!!passwordUser}
+        title={tx("Set new password for {full_name}:", {
+          full_name: passwordUser?.full_name || ''
+        })}
+        autoComplete="new-password"
+        onCancel={() => setPasswordUser(null)}
+        onConfirm={async password => {
+          await api.patch(
+            `/admin/users/${passwordUser.id}`,
+            { password }
+          )
+          alert(tx("Password updated."))
+        }}
+      />
 
       {showCreate && (
         <CreateUserModal

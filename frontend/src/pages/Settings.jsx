@@ -7,6 +7,7 @@ import {
   Key, Smartphone, Fingerprint, ShieldAlert, Copy
 } from 'lucide-react'
 import api from '../api'
+import PasswordPrompt from '../components/PasswordPrompt'
 import { useAuth, can } from '../hooks/useAuth'
 import { performWebAuthnRegister } from '../utils/webauthn'
 import { tx, txn, txr } from '../i18n/tx'
@@ -2155,6 +2156,7 @@ function ProxySection({ userRole }) {
 // ── Multi-Factor Authentication (MFA) Section ──────────────────────────────
 
 function MfaAccountSection({ user }) {
+  const [passwordAction, setPasswordAction] = useState(null)
   const [status, setStatus] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -2208,11 +2210,13 @@ function MfaAccountSection({ user }) {
     }
   }
 
-  const activateTotp = async e => {
+  const activateTotp = e => {
     e?.preventDefault()
     if (!totpCode.trim()) return
-    const currentPassword = window.prompt(tx("Your current password, to confirm it's really you"))
-    if (!currentPassword) return
+    setPasswordAction({ type: 'totp' })
+  }
+
+  const confirmActivateTotp = async currentPassword => {
     setError(''); setSuccess(''); setTotpSubmitting(true)
     try {
       const { data } = await api.post('/auth/mfa/totp/activate', {
@@ -2230,7 +2234,7 @@ function MfaAccountSection({ user }) {
       }
       loadStatus()
     } catch (err) {
-      setError(detailText(err) || tx("That code didn't work. Codes change every 30 seconds, so use the newest one."))
+      throw err
     } finally {
       setTotpSubmitting(false)
     }
@@ -2253,9 +2257,11 @@ function MfaAccountSection({ user }) {
     }
   }
 
-  const registerSecurityKey = async () => {
-    const currentPassword = window.prompt(tx("Your current password, to confirm it's really you"))
-    if (!currentPassword) return
+  const registerSecurityKey = () => {
+    setPasswordAction({ type: 'registerKey' })
+  }
+
+  const confirmRegisterSecurityKey = async currentPassword => {
     setError(''); setSuccess(''); setKeySubmitting(true)
     try {
       const { data: optData } = await api.post('/auth/mfa/webauthn/register-options')
@@ -2274,11 +2280,7 @@ function MfaAccountSection({ user }) {
       }
       loadStatus()
     } catch (err) {
-      if (err.name === 'NotAllowedError') {
-        setError('Security key interaction was cancelled or timed out.')
-      } else {
-        setError(detailText(err) || err.message || 'Failed to register security key.')
-      }
+      throw err
     } finally {
       setKeySubmitting(false)
     }
@@ -2286,15 +2288,17 @@ function MfaAccountSection({ user }) {
 
   const deleteKey = async (keyId, keyLabel) => {
     if (!confirm(tx("Remove security key \"{keyLabel}\"?", { keyLabel }))) return
-    const password = window.prompt(tx("Your password"))
-    if (!password) return
+    setPasswordAction({ type: 'deleteKey', keyId, keyLabel })
+  }
+
+  const confirmDeleteKey = async (keyId, keyLabel, password) => {
     setError(''); setSuccess('')
     try {
       await api.delete(`/auth/mfa/webauthn/${keyId}`, { data: { password } })
       setSuccess(tx("Removed security key \"{keyLabel}\".", { keyLabel }))
       loadStatus()
     } catch (err) {
-      setError(detailText(err) || tx("Failed to remove security key."))
+      throw err
     }
   }
 
@@ -2657,6 +2661,26 @@ function MfaAccountSection({ user }) {
           </div>
         </div>
       )}
+      <PasswordPrompt
+        isOpen={!!passwordAction}
+        title={passwordAction?.type === 'deleteKey'
+          ? tx('Confirm security key removal')
+          : tx("Your current password, to confirm it's really you")}
+        onCancel={() => setPasswordAction(null)}
+        onConfirm={async password => {
+          if (passwordAction?.type === 'totp') {
+            await confirmActivateTotp(password)
+          } else if (passwordAction?.type === 'registerKey') {
+            await confirmRegisterSecurityKey(password)
+          } else if (passwordAction?.type === 'deleteKey') {
+            await confirmDeleteKey(
+              passwordAction.keyId,
+              passwordAction.keyLabel,
+              password
+            )
+          }
+        }}
+      />
     </Section>
   )
 }
